@@ -307,7 +307,11 @@ class CodePage(Adw.NavigationPage):
         self.verify.set_sensitive(False)
         self.show_error(None)
         self.set_busy(False)
-        GLib.idle_add(self.entry.grab_focus)
+        GLib.idle_add(self._focus_entry)
+
+    def _focus_entry(self):
+        self.entry.grab_focus()
+        return GLib.SOURCE_REMOVE  # grab_focus() returns True, which would repeat
 
     def set_busy(self, busy, _message=None):
         self.verify.set_visible(not busy)
