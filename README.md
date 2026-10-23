@@ -388,3 +388,10 @@ This reports how many files are already local vs need downloading, without downl
 - The generated systemd unit is created by `./icloudctl`; the repo does not rely on checked-in service files anymore.
 - This project currently targets a user-level systemd service, not a system-wide root service.
 - When `auto_sync: false`, the SIGUSR1 signal triggers a one-shot sync in the background; `icloudctl sync` handles sending that signal and waiting for completion.
+
+## License
+
+The GNOME app, the iCloud Photos driver and this fork's other changes are
+MIT-licensed; see [LICENSE](LICENSE) for exactly what that covers. The
+original icloud-linux code by Ismaeel Akram was published without a license
+and remains under its author's copyright.

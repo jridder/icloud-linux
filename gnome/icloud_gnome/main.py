@@ -45,9 +45,10 @@ class Application(Adw.Application):
             application_icon=APP_ID,
             version=VERSION,
             comments="GNOME front end for icloud-linux, a FUSE client for iCloud Drive.",
-            website="https://github.com/IsmaeelAkram/icloud-linux",
-            license_type=Gtk.License.UNKNOWN,
-            developers=["Ismaeel Akram (icloud-linux)", "Jeff (GNOME app)"],
+            website="https://github.com/jridder/icloud-linux",
+            license_type=Gtk.License.CUSTOM,
+            license="The GNOME app and iCloud Photos driver are MIT-licensed. The original icloud-linux code has no license and remains under its author’s copyright.",
+            developers=["Ismaeel Akram (icloud-linux)", "Jeff Ridder (GNOME app, Photos)"],
         )
         about.present(self.props.active_window)
 

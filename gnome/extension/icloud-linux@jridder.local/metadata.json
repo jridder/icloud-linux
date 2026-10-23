@@ -3,5 +3,5 @@
   "name": "iCloud Drive",
   "description": "Panel status and controls for icloud-linux (iCloud Drive FUSE client).",
   "shell-version": ["50", "51"],
-  "url": "https://github.com/IsmaeelAkram/icloud-linux"
+  "url": "https://github.com/jridder/icloud-linux"
 }
