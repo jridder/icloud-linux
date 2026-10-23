@@ -182,7 +182,7 @@ class SignInFlow(GObject.Object):
         self.password.set_sensitive(not busy)
 
     def _show_error(self, message):
-        self.error.set_label(message)
+        self.error.set_label(message or "")
         self.error.set_visible(bool(message))
 
     def _submit(self):
