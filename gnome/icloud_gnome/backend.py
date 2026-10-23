@@ -231,7 +231,12 @@ class Service(GObject.Object):
             "org.freedesktop.systemd1", "/org/freedesktop/systemd1",
             "org.freedesktop.systemd1.Manager", None,
         )
-        self.manager.call_sync("Subscribe", None, Gio.DBusCallFlags.NONE, -1, None)
+        try:
+            self.manager.call_sync("Subscribe", None, Gio.DBusCallFlags.NONE, -1, None)
+        except GLib.Error as exc:
+            # Subscriptions are per bus connection, shared by every Service.
+            if "AlreadySubscribed" not in exc.message:
+                raise
         self.manager.connect("g-signal", self._on_manager_signal)
         self.refresh()
 
