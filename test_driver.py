@@ -1,5 +1,6 @@
 import errno
 import io
+import json
 import errno
 import os
 import stat
@@ -9,8 +10,13 @@ import stat
 import tempfile
 import threading
 import unittest
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
+# Keep status.json writes out of the real ~/.local/state during tests.
+_STATUS_DIR = tempfile.mkdtemp(prefix="icloud-linux-status-")
+os.environ["ICLOUD_STATUS_PATH"] = os.path.join(_STATUS_DIR, "status.json")
+
+import driver
 from driver import ICloudFS, ICloudSyncEngine, LocalMirror, SyncState
 from pyicloud.exceptions import PyiCloudAPIResponseException, PyiCloudFailedLoginException
 
@@ -862,6 +868,48 @@ class ICloudFSPathPolicyTests(unittest.TestCase):
             self.assertTrue(engine._path_allowed("/outside/file.txt"))
         finally:
             engine.shutdown()
+
+
+class StatusFileTests(unittest.TestCase):
+    def setUp(self):
+        self.root = tempfile.mkdtemp(prefix="icloud-linux-status-test-")
+        self.status = driver.StatusFile(os.path.join(self.root, "state", "status.json"))
+
+    def tearDown(self):
+        shutil.rmtree(self.root)
+
+    def read(self):
+        with open(self.status.path, encoding="utf-8") as handle:
+            return json.load(handle)
+
+    def test_phase_change_writes_immediately(self):
+        self.status.update(phase="ready")
+        self.status.update(phase="stopped")
+        self.assertEqual(self.read()["phase"], "stopped")
+
+    def test_progress_updates_are_throttled_and_merged(self):
+        self.status.update(phase="scanning", crawl={"folders": 1, "entries": 2})
+        self.status.update(crawl={"folders": 5})
+        self.assertEqual(self.read()["crawl"], {"folders": 1, "entries": 2})
+        self.status.update(force=True)
+        self.assertEqual(self.read()["crawl"], {"folders": 5, "entries": 2})
+
+
+class KeyringLookupTests(unittest.TestCase):
+    def test_returns_stored_password(self):
+        result = Mock(returncode=0, stdout="s3cret\n")
+        with patch("driver.subprocess.run", return_value=result) as run:
+            self.assertEqual(driver.lookup_keyring_password("a@b.c", Mock(), attempts=1), "s3cret")
+        self.assertEqual(
+            run.call_args[0][0],
+            ["secret-tool", "lookup", "service", "icloud-linux", "username", "a@b.c"],
+        )
+
+    def test_missing_secret_retries_then_gives_up(self):
+        result = Mock(returncode=1, stdout="")
+        with patch("driver.subprocess.run", return_value=result) as run, patch("driver.time.sleep"):
+            self.assertIsNone(driver.lookup_keyring_password("a@b.c", Mock(), attempts=3))
+        self.assertEqual(run.call_count, 3)
 
 
 if __name__ == "__main__":

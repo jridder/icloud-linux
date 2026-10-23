@@ -86,6 +86,36 @@ This will:
 
 After setup, your files will be mounted at `~/iCloud` unless you chose another path.
 
+## GNOME App and Panel Indicator
+
+`gnome/` adds a libadwaita app and a GNOME Shell extension on top of the
+same driver and user service:
+
+```bash
+gnome/install.sh          # installs into ~/.local (no root)
+```
+
+Then open **iCloud Drive** from the app grid. It walks through Apple ID
+sign-in (including 2FA), the mount folder and the download mode, then
+starts the service. Afterwards the app shows sync status and manages
+start/stop, login startup, synced and excluded folders, intervals,
+re-authentication, sign-out and the local cache. The panel icon shows the
+same status with Sync Now, Open iCloud Drive and an on/off switch. It
+appears after your next login.
+
+Differences from the CLI setup:
+
+- The Apple ID password is kept in GNOME Keyring (`secret-tool lookup service icloud-linux username <apple id>`),
+  not in `config.yaml`. The driver reads it from there when `password` is absent.
+- The driver writes `~/.local/state/icloud-linux/status.json` (phase,
+  scan and download progress, pending uploads, last sync) for the app and
+  the extension.
+- The app rewrites `config.yaml` without its comments.
+
+`gnome/uninstall.sh` removes it; `gnome/uninstall.sh --purge` also deletes
+config, session, cache and the keyring entry. The `icloudctl` commands keep
+working against the installed copy in `~/.local/share/icloud-linux`.
+
 ## Simple Setup, Step By Step
 
 If you prefer to do setup one step at a time:

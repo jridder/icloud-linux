@@ -11,6 +11,7 @@ import signal
 import shutil
 import sqlite3
 import stat
+import subprocess
 import sys
 import tempfile
 import threading
@@ -85,6 +86,72 @@ class Stat(fuse.Stat):
         self.st_atime = 0
         self.st_mtime = 0
         self.st_ctime = 0
+
+
+class StatusFile:
+    """Machine-readable service status for desktop front ends.
+
+    Writes ~/.local/state/icloud-linux/status.json atomically. Progress
+    updates are throttled; phase changes and explicit flushes are written
+    immediately.
+    """
+
+    MIN_INTERVAL = 1.0
+
+    def __init__(self, path=None):
+        self.path = path or os.environ.get("ICLOUD_STATUS_PATH") or os.path.join(
+            os.path.expanduser("~/.local/state/icloud-linux"), "status.json"
+        )
+        self.lock = threading.Lock()
+        self.last_write = 0.0
+        self.data = {"pid": os.getpid(), "phase": "starting"}
+
+    def update(self, force=False, **fields):
+        with self.lock:
+            for key, value in fields.items():
+                if isinstance(value, dict) and isinstance(self.data.get(key), dict):
+                    self.data[key] = {**self.data[key], **value}
+                else:
+                    self.data[key] = value
+            now = time.time()
+            if not force and "phase" not in fields and now - self.last_write < self.MIN_INTERVAL:
+                return
+            self.data["updated"] = now
+            self.last_write = now
+            try:
+                os.makedirs(os.path.dirname(self.path), exist_ok=True)
+                tmp = f"{self.path}.{os.getpid()}.tmp"
+                with open(tmp, "w", encoding="utf-8") as handle:
+                    json.dump(self.data, handle)
+                os.replace(tmp, self.path)
+            except OSError:
+                pass
+
+
+STATUS = StatusFile()
+
+
+def lookup_keyring_password(username, logger, attempts=6, delay=5):
+    """Fetch the Apple ID password stored by the GNOME app in the login keyring.
+
+    Retries briefly because the user service can start before the keyring
+    daemon is unlocked at login.
+    """
+    for attempt in range(attempts):
+        try:
+            result = subprocess.run(
+                ["secret-tool", "lookup", "service", "icloud-linux", "username", username],
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+            if result.returncode == 0 and result.stdout:
+                return result.stdout.rstrip("\n")
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            logger.warning("Keyring lookup failed: %s", exc)
+        if attempt + 1 < attempts:
+            time.sleep(delay)
+    return None
 
 
 class IgnoreIcdrsWarning(logging.Filter):
@@ -786,11 +853,13 @@ class ICloudSyncEngine:
     def start(self):
         if self.has_persistent_cache():
             self.logger.info("Using persistent local cache from %s", self.mirror.root)
+            STATUS.update(phase="reconciling")
             self._reconcile_persistent_cache()
             if self.warmup_mode == "background":
                 self._schedule_all_unhydrated()
         else:
             self.logger.info("Persistent cache not initialized yet; performing first remote crawl")
+            STATUS.update(phase="scanning")
             self.initial_scan()
             if self.warmup_mode == "background":
                 self._schedule_all_unhydrated()
@@ -814,6 +883,7 @@ class ICloudSyncEngine:
             if self.is_shutdown:
                 return
             self.is_shutdown = True
+            STATUS.update(phase="stopped")
             self.stop_event.set()
             self.refresh_now_event.set()
             with self.downloads_lock:
@@ -963,6 +1033,13 @@ class ICloudSyncEngine:
 
     def _crawl_remote_snapshot(self):
         self.logger.info("Starting remote metadata crawl")
+        STATUS.update(force=True, refreshing=True, crawl={"folders": 0, "entries": 0, "queued": 0})
+        try:
+            return self._crawl_remote_snapshot_inner()
+        finally:
+            STATUS.update(force=True, refreshing=False, last_refresh=time.time())
+
+    def _crawl_remote_snapshot_inner(self):
         snapshot = {}
         queue = deque()
         root = self.api.drive.root
@@ -1010,6 +1087,7 @@ class ICloudSyncEngine:
                             continue
                     queue.append((child, child_path))
 
+            STATUS.update(crawl={"folders": scanned_folders, "entries": len(snapshot), "queued": len(queue)})
             now = time.time()
             if scanned_folders == 1 or scanned_folders % 25 == 0 or now - last_progress_log >= 5:
                 self.logger.info(
@@ -1176,6 +1254,7 @@ class ICloudSyncEngine:
         with self.hydration_progress_lock:
             self.hydration_total = total
             self.hydration_completed = 0
+        STATUS.update(force=True, hydration={"completed": 0, "total": total})
         if total:
             self.logger.info("Background cache warmup scheduled for %s files", total)
         else:
@@ -1258,6 +1337,7 @@ class ICloudSyncEngine:
                 self.hydration_completed += 1
                 completed = self.hydration_completed
                 total = self.hydration_total
+            STATUS.update(force=completed == total, hydration={"completed": completed, "total": total})
             if total and (completed == 1 or completed == total or completed % 25 == 0):
                 self.logger.info(
                     "Background cache warmup progress: %s/%s files hydrated",
@@ -1266,6 +1346,7 @@ class ICloudSyncEngine:
                 )
         except Exception as exc:
             if self._is_auth_error(exc):
+                STATUS.update(force=True, auth_error=str(exc) or type(exc).__name__)
                 self.logger.error(
                     "Warmup download blocked by expired iCloud authentication for %s: %s. "
                     "Run './icloudctl auth' and then './icloudctl restart'.",
@@ -1331,11 +1412,19 @@ class ICloudSyncEngine:
             entry for entry in self.state.list_dirty_entries()
             if self._entry_allowed_to_sync(entry)
         ]
+        STATUS.update(pending_uploads=len(dirty_entries))
         if not dirty_entries:
             return
 
         self._log_sync("dirty-scan", dirty_count=len(dirty_entries))
+        STATUS.update(force=True, uploading=True)
+        try:
+            self._sync_dirty_entries(dirty_entries)
+        finally:
+            remaining = sum(1 for entry in self.state.list_dirty_entries() if self._entry_allowed_to_sync(entry))
+            STATUS.update(force=True, uploading=False, pending_uploads=remaining, last_upload=time.time())
 
+    def _sync_dirty_entries(self, dirty_entries):
         tombstones = sorted(
             [entry for entry in dirty_entries if entry["tombstone"]],
             key=lambda entry: (entry["path"].count("/"), entry["path"]),
@@ -1621,9 +1710,17 @@ class ICloudFS(Fuse):
         )
         return False
 
+    def fsinit(self):
+        # Called by fuse-python once the filesystem is mounted.
+        STATUS.update(
+            phase="ready" if self._is_authenticated() else "unauthenticated",
+            mountpoint=self.fuse_args.mountpoint,
+        )
+
     def shutdown(self):
         if self.sync_engine is not None:
             self.sync_engine.shutdown()
+        STATUS.update(phase="stopped")
 
     def request_remote_refresh(self):
         if self.sync_engine is None:
@@ -1643,6 +1740,7 @@ class ICloudFS(Fuse):
         self.username = username
         self.password = password
         self.cache_dir = cache_dir
+        STATUS.update(phase="connecting", username=username, auth_error=None)
         os.makedirs(self.cache_dir, exist_ok=True)
         if cookie_dir:
             os.makedirs(cookie_dir, exist_ok=True)
@@ -1699,6 +1797,7 @@ class ICloudFS(Fuse):
 
         except Exception as exc:
             self.logger.error("Failed to connect to iCloud: %s", exc)
+            STATUS.update(phase="unauthenticated", auth_error=str(exc) or type(exc).__name__)
             if require_session:
                 raise
             # Non-fatal path: park in unauthenticated state.  The FUSE layer
@@ -2195,8 +2294,13 @@ iCloud Linux: Mount iCloud Drive as a FUSE filesystem
     config = parse_config(args.config)
     username = config.get("username")
     password = config.get("password")
-    if not username or not password:
-        logger.error("Username or password not provided in config file")
+    if username and not password:
+        password = lookup_keyring_password(username, logger)
+        if not password:
+            # A trusted session cookie usually authenticates without it.
+            logger.warning("No password in config or keyring; relying on saved session")
+    if not username:
+        logger.error("Username not provided in config file")
         sys.exit(1)
 
     cache_dir = os.path.expanduser(config.get("cache_dir", "~/.cache/icloud-linux"))
@@ -2242,6 +2346,7 @@ iCloud Linux: Mount iCloud Drive as a FUSE filesystem
                 return
             logger.info("SIGUSR1: starting on-demand remote metadata crawl")
             try:
+                fs.sync_engine.sync_dirty_entries()
                 fs.sync_engine.initial_scan()
                 logger.info("SIGUSR1: on-demand remote metadata crawl complete")
             except Exception as exc:

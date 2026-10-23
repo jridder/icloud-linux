@@ -2,3 +2,5 @@
 sample-*.py
 samples/
 __pycache__/*.bak
+__pycache__/
+.venv/
