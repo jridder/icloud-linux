@@ -30,6 +30,8 @@ Important behavior:
 - Restarts reuse the existing cache instead of starting from zero.
 - If you open a file before it has finished hydrating, that file is downloaded first and then served locally.
 - Failed warmup downloads are retried automatically with backoff.
+- The first run mounts immediately; folders fill in as the first scan finds them.
+- Scans list up to `crawl_workers` folders at once (default 3); downloads stay serialized.
 - If a path changed both locally and remotely, the local version is preserved as a conflict copy instead of being silently overwritten.
 - With `auto_sync: false`, the driver starts and mounts immediately without spawning background polling threads. Run `icloudctl sync` when you want a fresh pull from iCloud.
 

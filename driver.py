@@ -18,7 +18,7 @@ import threading
 import time
 from contextlib import closing
 from collections import deque
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 
 import fuse
 import yaml
@@ -839,6 +839,7 @@ class ICloudSyncEngine:
         sync_paths=None,
         exclude_paths=None,
         auto_sync=True,
+        crawl_workers=1,
     ):
         self.api = api
         self.mirror = mirror
@@ -850,6 +851,8 @@ class ICloudSyncEngine:
         self.remote_refresh_interval_seconds = remote_refresh_interval_seconds
         self.warmup_workers = max(1, int(warmup_workers))
         self.auto_sync = bool(auto_sync)
+        self.crawl_workers = max(1, int(crawl_workers))
+        self.first_scan = None  # thread running the very first crawl, if any
         # An empty sync_paths value preserves unrestricted syncing.
         self.sync_paths = normalize_icloud_paths(sync_paths) or None
         self.exclude_paths = normalize_icloud_paths(exclude_paths)
@@ -891,11 +894,15 @@ class ICloudSyncEngine:
             if self.warmup_mode == "background":
                 self._schedule_all_unhydrated()
         else:
-            self.logger.info("Persistent cache not initialized yet; performing first remote crawl")
+            # Mount right away and show folders as the crawl finds them.
+            self.logger.info("Persistent cache not initialized yet; first remote crawl runs in the background")
             STATUS.update(phase="scanning")
-            self.initial_scan()
-            if self.warmup_mode == "background":
-                self._schedule_all_unhydrated()
+            self.first_scan = threading.Thread(target=self._run_first_scan, name="icloud-first-scan", daemon=True)
+            self.first_scan.start()
+            return
+        self._after_initial_state()
+
+    def _after_initial_state(self):
         if self.auto_sync:
             self._start_background_threads()
         else:
@@ -903,6 +910,32 @@ class ICloudSyncEngine:
                 "auto_sync disabled — background upload/refresh threads not started. "
                 "Use 'icloudctl sync' to trigger a one-shot refresh on demand."
             )
+
+    def _run_first_scan(self):
+        try:
+            crawl_started_at = int(time.time())
+            snapshot = self._crawl_remote_snapshot(on_folder=self._materialize_new)
+            if self.stop_event.is_set():
+                return
+            # Full pass for anything the incremental one skipped (conflicts with
+            # files created locally meanwhile, renames).
+            self._apply_remote_snapshot(snapshot, crawl_started_at=crawl_started_at)
+            if self.warmup_mode == "background":
+                self._schedule_all_unhydrated()
+            STATUS.update(phase="ready")
+            self._after_initial_state()
+        except Exception as exc:
+            self.logger.error("First remote crawl failed: %s", exc)
+            STATUS.update(phase="ready", error=str(exc))
+            self._after_initial_state()
+        finally:
+            self.first_scan = None
+
+    def _materialize_new(self, metas):
+        for meta in metas:
+            if self.state.get_entry(meta["path"]) is None and \
+                    self.state.get_entry_by_remote_id(meta["remote_drivewsid"]) is None:
+                self._materialize_remote_entry(meta)
 
     def _start_background_threads(self):
         upload_thread = threading.Thread(target=self._upload_loop, name="icloud-upload", daemon=True)
@@ -1064,72 +1097,90 @@ class ICloudSyncEngine:
             self.state.mark_hydrated(path, checksum, stats.st_size, int(stats.st_mtime))
             self._log_sync("hydrate-complete", level=logging.INFO, path=path, source="remote", size=stats.st_size)
 
-    def _crawl_remote_snapshot(self):
+    def _crawl_remote_snapshot(self, on_folder=None):
         self.logger.info("Starting remote metadata crawl")
         STATUS.update(force=True, refreshing=True, crawl={"folders": 0, "entries": 0, "queued": 0})
         try:
-            return self._crawl_remote_snapshot_inner()
+            return self._crawl_remote_snapshot_inner(on_folder)
         finally:
             STATUS.update(force=True, refreshing=False, last_refresh=time.time())
 
-    def _crawl_remote_snapshot_inner(self):
+    def _should_recurse(self, child_path):
+        # With sync_paths set, only descend into folders on the way to or
+        # inside a sync path, so a /Downloads-only setup skips the rest.
+        if self.sync_paths is None:
+            return True
+        cp = child_path.rstrip("/")
+        for sp in self.sync_paths:
+            sp = sp.rstrip("/")
+            if sp.startswith(cp + "/") or sp == cp or cp.startswith(sp + "/"):
+                return True
+        return False
+
+    def _crawl_remote_snapshot_inner(self, on_folder=None):
+        """Breadth-first listing of the drive, crawl_workers folders at a time.
+
+        *on_folder(metas)* is called with each folder's children as soon as
+        they arrive, so the first scan can show folders while it runs.
+        """
         snapshot = {}
-        queue = deque()
-        root = self.api.drive.root
-        queue.append((root, "/"))
+        queue = deque([(self.api.drive.root, "/")])
         started_at = time.time()
         last_progress_log = started_at
         scanned_folders = 0
-        _crawl_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="icloud-crawl")
         FOLDER_TIMEOUT = 60  # seconds per folder before giving up
+        executor = ThreadPoolExecutor(max_workers=self.crawl_workers, thread_name_prefix="icloud-crawl")
+        in_flight = {}  # future -> (path, submitted_at)
 
-        while queue:
-            node, path = queue.popleft()
-            scanned_folders += 1
-            try:
-                future = _crawl_executor.submit(node.get_children, True)
-                children = future.result(timeout=FOLDER_TIMEOUT)
-            except TimeoutError:
-                self.logger.warning(
-                    "Timed out enumerating %s after %ss — skipping folder", path, FOLDER_TIMEOUT
-                )
-                continue
-            except Exception as exc:
-                self.logger.error("Failed to enumerate %s: %s", path, exc)
-                continue
+        try:
+            while queue or in_flight:
+                while queue and len(in_flight) < self.crawl_workers:
+                    node, path = queue.popleft()
+                    in_flight[executor.submit(node.get_children, True)] = (path, time.time())
 
-            for child in children:
-                child_path = "/" + child.name if path == "/" else path.rstrip("/") + "/" + child.name
-                meta = self._node_to_meta(child, child_path)
-                snapshot[meta["remote_drivewsid"]] = meta
-                if self._is_directory_type(meta["type"]):
-                    # If sync_paths is set, only recurse into directories that are
-                    # on the path to or inside a sync_path. This avoids crawling
-                    # the entire iCloud Drive when only /Downloads is needed.
-                    if self.sync_paths is not None:
-                        should_recurse = False
-                        for sp in self.sync_paths:
-                            sp = sp.rstrip("/")
-                            cp = child_path.rstrip("/")
-                            # Recurse if child is a prefix of sync_path (ancestor)
-                            # or if child is inside sync_path (descendant)
-                            if sp.startswith(cp + "/") or sp == cp or cp.startswith(sp + "/"):
-                                should_recurse = True
-                                break
-                        if not should_recurse:
-                            continue
-                    queue.append((child, child_path))
+                done, _pending = wait(in_flight, timeout=1, return_when=FIRST_COMPLETED)
+                now = time.time()
+                for future, (path, submitted) in list(in_flight.items()):
+                    if future not in done and now - submitted > FOLDER_TIMEOUT:
+                        self.logger.warning(
+                            "Timed out enumerating %s after %ss — skipping folder", path, FOLDER_TIMEOUT
+                        )
+                        del in_flight[future]
 
-            STATUS.update(crawl={"folders": scanned_folders, "entries": len(snapshot), "queued": len(queue)})
-            now = time.time()
-            if scanned_folders == 1 or scanned_folders % 25 == 0 or now - last_progress_log >= 5:
-                self.logger.info(
-                    "Remote metadata crawl progress: %s folders scanned, %s entries discovered, %s folders queued",
-                    scanned_folders,
-                    len(snapshot),
-                    len(queue),
-                )
-                last_progress_log = now
+                for future in done:
+                    path, _submitted = in_flight.pop(future)
+                    scanned_folders += 1
+                    try:
+                        children = future.result()
+                    except Exception as exc:
+                        self.logger.error("Failed to enumerate %s: %s", path, exc)
+                        continue
+
+                    metas = []
+                    for child in children:
+                        child_path = "/" + child.name if path == "/" else path.rstrip("/") + "/" + child.name
+                        meta = self._node_to_meta(child, child_path)
+                        snapshot[meta["remote_drivewsid"]] = meta
+                        metas.append(meta)
+                        if self._is_directory_type(meta["type"]) and self._should_recurse(child_path):
+                            queue.append((child, child_path))
+                    if on_folder is not None:
+                        on_folder(metas)
+
+                    STATUS.update(crawl={"folders": scanned_folders, "entries": len(snapshot),
+                                         "queued": len(queue) + len(in_flight)})
+                    if scanned_folders == 1 or scanned_folders % 25 == 0 or now - last_progress_log >= 5:
+                        self.logger.info(
+                            "Remote metadata crawl progress: %s folders scanned, %s entries discovered, %s folders queued",
+                            scanned_folders,
+                            len(snapshot),
+                            len(queue) + len(in_flight),
+                        )
+                        last_progress_log = now
+                if self.stop_event.is_set():
+                    break
+        finally:
+            executor.shutdown(wait=False, cancel_futures=True)
 
         self.logger.info(
             "Remote metadata crawl complete: %s entries across %s folders in %.1fs",
@@ -1745,10 +1796,13 @@ class ICloudFS(Fuse):
 
     def fsinit(self):
         # Called by fuse-python once the filesystem is mounted.
-        STATUS.update(
-            phase="ready" if self._is_authenticated() else "unauthenticated",
-            mountpoint=self.fuse_args.mountpoint,
-        )
+        if not self._is_authenticated():
+            phase = "unauthenticated"
+        elif self.sync_engine is not None and self.sync_engine.first_scan is not None:
+            phase = "scanning"
+        else:
+            phase = "ready"
+        STATUS.update(phase=phase, mountpoint=self.fuse_args.mountpoint)
 
     def shutdown(self):
         if self.sync_engine is not None:
@@ -1861,6 +1915,7 @@ class ICloudFS(Fuse):
         sync_paths=None,
         exclude_paths=None,
         auto_sync=True,
+        crawl_workers=1,
     ):
         self.mirror = LocalMirror(cache_dir)
         state_path = os.path.join(cache_dir, "state.sqlite3")
@@ -1884,6 +1939,7 @@ class ICloudFS(Fuse):
             sync_paths=sync_paths,
             exclude_paths=exclude_paths,
             auto_sync=auto_sync,
+            crawl_workers=crawl_workers,
         )
         self.sync_engine.start()
 
@@ -2346,6 +2402,7 @@ iCloud Linux: Mount iCloud Drive as a FUSE filesystem
     sync_paths = config.get("sync_paths", None)      # list of iCloud paths to hydrate, None=all
     exclude_paths = config.get("exclude_paths", None) # deny-list applied before sync_paths
     auto_sync = bool(config.get("auto_sync", True))   # False = manual sync only via icloudctl sync
+    crawl_workers = int(config.get("crawl_workers", 3))  # parallel folder listings per crawl
 
     # When running under systemd (no TTY) we never want a failed auth to crash
     # the process — that would trigger Restart=on-failure and hammer Apple's
@@ -2375,6 +2432,9 @@ iCloud Linux: Mount iCloud Drive as a FUSE filesystem
                 time.sleep(1)
             if fs.sync_engine is None:
                 logger.warning("SIGUSR1: sync engine not available (unauthenticated or startup failed)")
+                return
+            if fs.sync_engine.first_scan is not None:
+                logger.info("SIGUSR1: first remote crawl still running; skipping on-demand crawl")
                 return
             logger.info("SIGUSR1: starting on-demand remote metadata crawl")
             try:
@@ -2410,6 +2470,7 @@ iCloud Linux: Mount iCloud Drive as a FUSE filesystem
         sync_paths=sync_paths,
         exclude_paths=exclude_paths,
         auto_sync=auto_sync,
+        crawl_workers=crawl_workers,
     )
 
     try:

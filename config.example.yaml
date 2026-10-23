@@ -26,6 +26,11 @@ remote_refresh_interval_seconds: 300
 # parallel reads appear to trigger server-side auth/throttling failures.
 warmup_workers: 1
 
+# Folder listings sent to iCloud at once while scanning for changes. Measured
+# on a real account: 3 lists folders 3x faster than 1 with no throttling.
+# File downloads stay one at a time (warmup_workers). Set 1 if Apple pushes back.
+crawl_workers: 3
+
 # Persistent cookie/session directory used after one-time 2FA bootstrap
 cookie_dir: "~/.config/icloud-linux/cookies"
 

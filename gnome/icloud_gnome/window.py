@@ -61,7 +61,7 @@ def summarize(service, status, config):
     if phase == "scanning":
         entries = crawl.get("entries", 0)
         return ("io.github.jridder.ICloudLinux-syncing-symbolic", "Scanning iCloud Drive…",
-                f"{entries:,} items found — your folder appears when the first scan finishes", None, "accent")
+                f"{entries:,} items found so far — folders fill in as they’re found", None, "accent")
     if phase == "reconciling":
         return ("io.github.jridder.ICloudLinux-syncing-symbolic", "Checking Downloaded Files…", None, None, "accent")
     if phase == "stopped":
@@ -634,7 +634,7 @@ class MainPage(Adw.NavigationPage):
         needs_auth = fresh and (status.get("phase") == "unauthenticated" or bool(status.get("auth_error")))
         self.signin_button.set_visible(needs_auth)
         self.open_button.set_visible(not needs_auth)
-        self.open_button.set_sensitive(fresh and status.get("phase") == "ready")
+        self.open_button.set_sensitive(fresh and status.get("phase") in ("ready", "scanning"))
         busy = status.get("refreshing") or status.get("uploading")
         if self._syncing and not busy and fresh:
             self._syncing = False

@@ -9,6 +9,7 @@ import sqlite3
 import stat
 import tempfile
 import threading
+import time
 import unittest
 from unittest.mock import Mock, patch
 
@@ -513,12 +514,55 @@ class SyncEngineStartupTests(unittest.TestCase):
         )
         self.assertTrue(reentered)
 
-    def test_start_performs_initial_scan_on_first_run(self):
-        self.engine.start()
+    def test_first_run_crawls_in_background_and_finishes_setup(self):
+        self.engine._crawl_remote_snapshot = Mock(return_value={})
+        self.engine._apply_remote_snapshot = Mock()
 
-        self.engine.initial_scan.assert_called_once()
+        self.engine.start()
+        self.engine.first_scan.join(timeout=10)
+
+        self.engine._crawl_remote_snapshot.assert_called_once()
+        self.engine._apply_remote_snapshot.assert_called_once()
         self.engine._reconcile_persistent_cache.assert_not_called()
         self.engine._schedule_all_unhydrated.assert_called_once()
+        self.engine._start_background_threads.assert_called_once()
+        self.assertIsNone(self.engine.first_scan)
+
+    def test_first_run_shows_folders_before_the_crawl_finishes(self):
+        release = threading.Event()
+        listed = threading.Event()
+        meta = {
+            "path": "/Documents",
+            "type": "folder",
+            "parent_path": "/",
+            "remote_drivewsid": "FOLDER::docs",
+            "remote_docwsid": "docs",
+            "remote_etag": "1",
+            "remote_zone": "com.apple.CloudDocs",
+            "remote_shareid": None,
+            "size": 0,
+            "mtime": 0,
+        }
+
+        def crawl(on_folder=None):
+            on_folder([meta])
+            listed.set()
+            release.wait(10)
+            return {meta["remote_drivewsid"]: meta}
+
+        self.engine._crawl_remote_snapshot = crawl
+        self.engine.start()  # returns immediately; the crawl is still "running"
+        self.assertTrue(listed.wait(10))
+
+        self.assertIsNotNone(self.engine.first_scan)
+        self.assertTrue(self.mirror.is_dir("/Documents"))
+        self.assertIsNotNone(self.state.get_entry("/Documents"))
+        self.engine._start_background_threads.assert_not_called()
+
+        release.set()
+        thread = self.engine.first_scan
+        if thread is not None:
+            thread.join(timeout=10)
         self.engine._start_background_threads.assert_called_once()
 
     def test_failed_download_is_retried_with_backoff(self):
@@ -868,6 +912,69 @@ class ICloudFSPathPolicyTests(unittest.TestCase):
             self.assertTrue(engine._path_allowed("/outside/file.txt"))
         finally:
             engine.shutdown()
+
+
+class FakeNode:
+    """Drive folder whose listing takes *delay* seconds, like a round-trip."""
+
+    def __init__(self, name, children=(), delay=0.1, fail=False, tracker=None):
+        self.name = name
+        self.children = list(children)
+        self.delay = delay
+        self.fail = fail
+        self.tracker = tracker
+        kind = "FOLDER" if children or name.startswith("dir") else "FILE"
+        self.data = {"type": kind, "drivewsid": f"{kind}::{name}", "docwsid": name, "etag": "1",
+                     "zone": "z", "size": 1, "dateModified": "2024-01-01T00:00:00Z"}
+
+    def get_children(self, force=False):
+        if self.tracker is not None:
+            with self.tracker["lock"]:
+                self.tracker["now"] += 1
+                self.tracker["max"] = max(self.tracker["max"], self.tracker["now"])
+        try:
+            time.sleep(self.delay)
+            if self.fail:
+                raise RuntimeError("boom")
+            return self.children
+        finally:
+            if self.tracker is not None:
+                with self.tracker["lock"]:
+                    self.tracker["now"] -= 1
+
+
+class ParallelCrawlTests(unittest.TestCase):
+    def tree(self, tracker):
+        dirs = [
+            FakeNode(f"dir{i}", [FakeNode(f"file{i}-{j}") for j in range(3)], tracker=tracker)
+            for i in range(6)
+        ]
+        dirs.append(FakeNode("dirbroken", fail=True, tracker=tracker))
+        return FakeNode("root", dirs, tracker=tracker)
+
+    def crawl(self, workers):
+        tracker = {"lock": threading.Lock(), "now": 0, "max": 0}
+        api = Mock()
+        api.drive.root = self.tree(tracker)
+        root = tempfile.mkdtemp(prefix="icloud-linux-test-")
+        self.addCleanup(shutil.rmtree, root)
+        engine = ICloudSyncEngine(api, LocalMirror(root), SyncState(os.path.join(root, "s.db")), Mock(),
+                                  crawl_workers=workers)
+        seen = []
+        started = time.time()
+        snapshot = engine._crawl_remote_snapshot(on_folder=seen.append)
+        return snapshot, time.time() - started, tracker["max"], seen
+
+    def test_parallel_crawl_finds_the_same_tree_faster(self):
+        serial, serial_time, serial_max, _ = self.crawl(1)
+        parallel, parallel_time, parallel_max, seen = self.crawl(3)
+        self.assertEqual(sorted(m["path"] for m in serial.values()),
+                         sorted(m["path"] for m in parallel.values()))
+        self.assertEqual(len(parallel), 7 + 18)  # broken folder listed, its contents not
+        self.assertEqual(serial_max, 1)
+        self.assertLessEqual(parallel_max, 3)
+        self.assertLess(parallel_time, serial_time * 0.7)
+        self.assertEqual(sum(len(batch) for batch in seen), len(parallel))
 
 
 class StatusFileTests(unittest.TestCase):

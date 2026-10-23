@@ -58,7 +58,7 @@ function summarize(unit, status) {
     if (status.phase === 'starting' || status.phase === 'connecting')
         return {icon: 'syncing', title: 'Connecting…'};
     if (status.phase === 'scanning')
-        return {icon: 'syncing', title: `Scanning… ${(crawl.entries ?? 0).toLocaleString()} items`};
+        return {icon: 'syncing', title: `Scanning… ${(crawl.entries ?? 0).toLocaleString()} items`, browsable: true};
     if (status.phase === 'reconciling')
         return {icon: 'syncing', title: 'Checking downloaded files…'};
     if (status.phase === 'stopped')
@@ -153,7 +153,7 @@ class Indicator extends PanelMenu.Button {
         this._setIcon(s.icon);
         this._statusItem.label.text = `iCloud Drive: ${s.title}`;
         this._openItem.visible = !s.setup;
-        this._openItem.setSensitive(Boolean(s.ready));
+        this._openItem.setSensitive(Boolean(s.ready || s.browsable));
         this._photosItem.visible = !s.setup && this._photosUnit.ActiveState === 'active';
         this._syncItem.visible = !s.setup && !s.auth;
         this._syncItem.setSensitive(Boolean(s.ready) && !this._status.refreshing && !this._status.uploading);
