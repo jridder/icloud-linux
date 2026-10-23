@@ -28,15 +28,20 @@ CONFIG_DIR = HOME / ".config" / "icloud-linux"
 CONFIG_FILE = CONFIG_DIR / "config.yaml"
 ENV_FILE = CONFIG_DIR / "icloud.env"
 SERVICE_FILE = HOME / ".config" / "systemd" / "user" / "icloud.service"
+PHOTOS_SERVICE_FILE = HOME / ".config" / "systemd" / "user" / "icloud-photos.service"
+PHOTOS_ENV_FILE = CONFIG_DIR / "photos.env"
 STATE_DIR = HOME / ".local" / "state" / "icloud-linux"
 STATUS_FILE = STATE_DIR / "status.json"
+PHOTOS_STATUS_FILE = STATE_DIR / "photos-status.json"
 LOG_FILE = STATE_DIR / "icloud.log"
 DEFAULT_CACHE_DIR = HOME / ".cache" / "icloud-linux"
 DEFAULT_COOKIE_DIR = CONFIG_DIR / "cookies"
 DEFAULT_MOUNT = HOME / "iCloud"
+DEFAULT_PHOTOS_MOUNT = HOME / "iCloud Photos"
 BOOKMARKS_FILE = HOME / ".config" / "gtk-3.0" / "bookmarks"
 
 UNIT = "icloud.service"
+PHOTOS_UNIT = "icloud-photos.service"
 
 # Same attributes the driver passes to `secret-tool lookup`.
 SECRET_SCHEMA = Secret.Schema.new(
@@ -95,18 +100,26 @@ def is_configured():
     return bool(load_config().get("username")) and SERVICE_FILE.exists()
 
 
-def mount_dir():
-    """The mount point icloudctl recorded (it writes the env file with printf %q)."""
-    if not ENV_FILE.exists():
-        return DEFAULT_MOUNT
+def _env_value(env_file, name, default):
+    """A variable from an env file icloudctl wrote with printf %q."""
+    if not env_file.exists():
+        return default
     try:
         out = subprocess.run(
-            ["bash", "-c", 'source "$1" && printf %s "$ICLOUD_MOUNT"', "bash", str(ENV_FILE)],
+            ["bash", "-c", f'source "$1" && printf %s "${name}"', "bash", str(env_file)],
             capture_output=True, text=True, timeout=5,
         ).stdout
     except (OSError, subprocess.TimeoutExpired):
         out = ""
-    return Path(out) if out else DEFAULT_MOUNT
+    return Path(out) if out else default
+
+
+def mount_dir():
+    return _env_value(ENV_FILE, "ICLOUD_MOUNT", DEFAULT_MOUNT)
+
+
+def photos_mount_dir():
+    return _env_value(PHOTOS_ENV_FILE, "ICLOUD_PHOTOS_MOUNT", DEFAULT_PHOTOS_MOUNT)
 
 
 def mirror_dir():
@@ -148,12 +161,16 @@ def clear_password(username):
 
 # ── status ──────────────────────────────────────────────────────────────────
 
-def read_status():
+def read_status(path=STATUS_FILE):
     try:
-        with open(STATUS_FILE, encoding="utf-8") as handle:
+        with open(path, encoding="utf-8") as handle:
             return json.load(handle)
     except (OSError, ValueError):
         return {}
+
+
+def read_photos_status():
+    return read_status(PHOTOS_STATUS_FILE)
 
 
 def file_counts():
@@ -196,12 +213,14 @@ def tail_log(lines=400):
 # ── systemd ─────────────────────────────────────────────────────────────────
 
 class Service(GObject.Object):
-    """Tracks icloud.service over the systemd user bus."""
+    """Tracks one systemd user unit (icloud.service by default) over D-Bus."""
 
     __gsignals__ = {"changed": (GObject.SignalFlags.RUN_FIRST, None, ())}
 
-    def __init__(self):
+    def __init__(self, unit=UNIT):
         super().__init__()
+        self.unit = unit
+        self.load_state = "not-found"
         self.active_state = "inactive"
         self.unit_file_state = ""
         self.main_pid = 0
@@ -224,7 +243,7 @@ class Service(GObject.Object):
         if self._unit is None:
             try:
                 path = self.manager.call_sync(
-                    "LoadUnit", GLib.Variant("(s)", (UNIT,)), Gio.DBusCallFlags.NONE, -1, None
+                    "LoadUnit", GLib.Variant("(s)", (self.unit,)), Gio.DBusCallFlags.NONE, -1, None
                 ).unpack()[0]
             except GLib.Error:
                 return
@@ -248,6 +267,7 @@ class Service(GObject.Object):
             value = proxy.get_cached_property(name)
             return value.unpack() if value is not None else default
 
+        self.load_state = prop(self._unit, "LoadState", "not-found")
         self.active_state = prop(self._unit, "ActiveState", "inactive")
         self.unit_file_state = prop(self._unit, "UnitFileState", "")
         self.main_pid = prop(self._service, "MainPID", 0)
@@ -256,6 +276,10 @@ class Service(GObject.Object):
     @property
     def running(self):
         return self.active_state in ("active", "activating", "reloading")
+
+    @property
+    def installed(self):
+        return self.load_state == "loaded"
 
     @property
     def enabled(self):
@@ -278,13 +302,13 @@ class Service(GObject.Object):
         self._call("Reload", None, lambda error: (self.refresh(), callback and callback(error)))
 
     def start(self, callback=None):
-        self._call("StartUnit", GLib.Variant("(ss)", (UNIT, "replace")), callback)
+        self._call("StartUnit", GLib.Variant("(ss)", (self.unit, "replace")), callback)
 
     def stop(self, callback=None):
-        self._call("StopUnit", GLib.Variant("(ss)", (UNIT, "replace")), callback)
+        self._call("StopUnit", GLib.Variant("(ss)", (self.unit, "replace")), callback)
 
     def restart(self, callback=None):
-        self._call("RestartUnit", GLib.Variant("(ss)", (UNIT, "replace")), callback)
+        self._call("RestartUnit", GLib.Variant("(ss)", (self.unit, "replace")), callback)
 
     def set_enabled(self, enabled, callback=None):
         def done(error):
@@ -294,13 +318,13 @@ class Service(GObject.Object):
                 self.daemon_reload(callback)
 
         if enabled:
-            self._call("EnableUnitFiles", GLib.Variant("(asbb)", ([UNIT], False, True)), done)
+            self._call("EnableUnitFiles", GLib.Variant("(asbb)", ([self.unit], False, True)), done)
         else:
-            self._call("DisableUnitFiles", GLib.Variant("(asb)", ([UNIT], False)), done)
+            self._call("DisableUnitFiles", GLib.Variant("(asb)", ([self.unit], False)), done)
 
     def sync_now(self, callback=None):
-        # SIGUSR1 = upload local changes, then crawl remote metadata.
-        self._call("KillUnit", GLib.Variant("(ssi)", (UNIT, "main", 10)), callback)
+        # SIGUSR1 = sync now (Drive: upload, then crawl; Photos: rescan).
+        self._call("KillUnit", GLib.Variant("(ssi)", (self.unit, "main", 10)), callback)
 
 
 def run_icloudctl(args, callback):

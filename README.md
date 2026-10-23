@@ -112,6 +112,25 @@ Differences from the CLI setup:
   the extension.
 - The app rewrites `config.yaml` without its comments.
 
+### iCloud Photos (read-only)
+
+Turn on **Show iCloud Photos** in the app (or run `./icloudctl photos-init`
+and `systemctl --user start icloud-photos.service`) to mount your photo
+library at `~/iCloud Photos`:
+
+- `Library/<year>/<year-month>/` holds every photo and video by date taken.
+- `Albums/` holds your albums (album folders become directories) plus
+  Favorites, Screenshots and Videos. Hidden and Recently Deleted are left out.
+- Live Photos appear as the photo plus a `.MOV` with the same name.
+
+The mount is read-only. Nothing on Linux can change or delete your photos.
+Originals download when opened (or all of them in the background with
+`photos_warmup_mode: background`) into `~/.cache/icloud-linux/photos`.
+Desktop thumbnailers opening a photo that is not downloaded yet get Apple's
+JPEG preview instead, so browsing in Files shows thumbnails without pulling
+down every original. The service reuses the Drive session; sign in again in
+the app if Apple expires it.
+
 `gnome/uninstall.sh` removes it; `gnome/uninstall.sh --purge` also deletes
 config, session, cache and the keyring entry. The `icloudctl` commands keep
 working against the installed copy in `~/.local/share/icloud-linux`.

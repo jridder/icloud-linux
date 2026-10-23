@@ -10,6 +10,7 @@ import * as PopupMenu from 'resource:///org/gnome/shell/ui/popupMenu.js';
 
 const APP_ID = 'io.github.jridder.ICloudLinux';
 const UNIT = 'icloud.service';
+const PHOTOS_UNIT = 'icloud-photos.service';
 const STATE_DIR = GLib.build_filenamev([GLib.get_home_dir(), '.local', 'state', 'icloud-linux']);
 const POLL_SECONDS = 5;
 
@@ -27,9 +28,9 @@ function run(argv) {
     });
 }
 
-function readStatus() {
+function readStatus(name = 'status.json') {
     try {
-        const [, bytes] = GLib.file_get_contents(GLib.build_filenamev([STATE_DIR, 'status.json']));
+        const [, bytes] = GLib.file_get_contents(GLib.build_filenamev([STATE_DIR, name]));
         return JSON.parse(new TextDecoder().decode(bytes));
     } catch (e) {
         return {};
@@ -79,6 +80,7 @@ class Indicator extends PanelMenu.Button {
         super._init(0.0, 'iCloud Drive');
         this._extension = extension;
         this._unit = {};
+        this._photosUnit = {};
         this._status = {};
 
         this._icon = new St.Icon({style_class: 'system-status-icon'});
@@ -89,9 +91,12 @@ class Indicator extends PanelMenu.Button {
         this.menu.addMenuItem(this._statusItem);
         this.menu.addMenuItem(new PopupMenu.PopupSeparatorMenuItem());
 
-        this._openItem = this.menu.addAction('Open iCloud Drive', () => this._openFolder());
-        this._syncItem = this.menu.addAction('Sync Now', () =>
-            run(['systemctl', '--user', 'kill', '--kill-whom=main', '--signal=SIGUSR1', UNIT]).then(() => this._poll()));
+        this._openItem = this.menu.addAction('Open iCloud Drive', () => this._openFolder(this._status, 'iCloud'));
+        this._photosItem = this.menu.addAction('Open iCloud Photos', () => this._openFolder(readStatus('photos-status.json'), 'iCloud Photos'));
+        this._syncItem = this.menu.addAction('Sync Now', () => {
+            const units = this._photosUnit.ActiveState === 'active' ? [UNIT, PHOTOS_UNIT] : [UNIT];
+            run(['systemctl', '--user', 'kill', '--kill-whom=main', '--signal=SIGUSR1', ...units]).then(() => this._poll());
+        });
         this._authItem = this.menu.addAction('Sign In…', () => this._launchApp());
 
         this._switch = new PopupMenu.PopupSwitchMenuItem('iCloud Drive', false);
@@ -121,17 +126,22 @@ class Indicator extends PanelMenu.Button {
     }
 
     async _poll() {
-        const {out} = await run(['systemctl', '--user', 'show', UNIT,
+        // `systemctl show` separates units with a blank line, in argument order.
+        const {out} = await run(['systemctl', '--user', 'show', UNIT, PHOTOS_UNIT,
             '--property=LoadState,ActiveState,MainPID,UnitFileState']);
-        const unit = {};
-        for (const line of out.split('\n')) {
-            const i = line.indexOf('=');
-            if (i > 0)
-                unit[line.slice(0, i)] = line.slice(i + 1);
-        }
+        const [unit, photosUnit] = out.split('\n\n').map(block => {
+            const props = {};
+            for (const line of block.split('\n')) {
+                const i = line.indexOf('=');
+                if (i > 0)
+                    props[line.slice(0, i)] = line.slice(i + 1);
+            }
+            return props;
+        });
         if (this._destroyed)
             return;
-        this._unit = unit;
+        this._unit = unit ?? {};
+        this._photosUnit = photosUnit ?? {};
         this._update();
     }
 
@@ -143,6 +153,7 @@ class Indicator extends PanelMenu.Button {
         this._statusItem.label.text = `iCloud Drive: ${s.title}`;
         this._openItem.visible = !s.setup;
         this._openItem.setSensitive(Boolean(s.ready));
+        this._photosItem.visible = !s.setup && this._photosUnit.ActiveState === 'active';
         this._syncItem.visible = !s.setup && !s.auth;
         this._syncItem.setSensitive(Boolean(s.ready) && !this._status.refreshing && !this._status.uploading);
         this._authItem.visible = Boolean(s.auth);
@@ -151,8 +162,8 @@ class Indicator extends PanelMenu.Button {
         this._settingsItem.label.text = s.setup ? 'Set Up iCloud Drive…' : 'iCloud Drive Settings';
     }
 
-    _openFolder() {
-        const mount = this._status.mountpoint || GLib.build_filenamev([GLib.get_home_dir(), 'iCloud']);
+    _openFolder(status, fallback) {
+        const mount = status.mountpoint || GLib.build_filenamev([GLib.get_home_dir(), fallback]);
         Gio.AppInfo.launch_default_for_uri(Gio.File.new_for_path(mount).get_uri(), global.create_app_launch_context(0, -1));
     }
 

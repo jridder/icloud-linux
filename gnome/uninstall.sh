@@ -21,6 +21,12 @@ if [[ -f "$HOME/.config/icloud-linux/icloud.env" ]]; then
   mount="$(source "$HOME/.config/icloud-linux/icloud.env" && printf %s "${ICLOUD_MOUNT:-}")"
 fi
 
+photos_mount=""
+if [[ -f "$HOME/.config/icloud-linux/photos.env" ]]; then
+  # shellcheck disable=SC1091
+  photos_mount="$(source "$HOME/.config/icloud-linux/photos.env" && printf %s "${ICLOUD_PHOTOS_MOUNT:-}")"
+fi
+
 if [[ -x "$DEST/icloudctl" ]]; then
   "$DEST/icloudctl" uninstall ${purge:+--purge}
 else
@@ -33,10 +39,12 @@ if [[ "$purge" == "--purge" && -n "$username" ]]; then
   secret-tool clear service icloud-linux username "$username" 2>/dev/null || true
 fi
 
-if [[ -n "$mount" && -f "$HOME/.config/gtk-3.0/bookmarks" ]]; then
-  uri="$(python3 -c 'import sys; from gi.repository import Gio; print(Gio.File.new_for_path(sys.argv[1]).get_uri())' "$mount")"
-  sed -i "\\|^$uri\\( \\|\$\\)|d" "$HOME/.config/gtk-3.0/bookmarks"
-fi
+for m in "$mount" "$photos_mount"; do
+  if [[ -n "$m" && -f "$HOME/.config/gtk-3.0/bookmarks" ]]; then
+    uri="$(python3 -c 'import sys; from gi.repository import Gio; print(Gio.File.new_for_path(sys.argv[1]).get_uri())' "$m")"
+    sed -i "\\|^$uri\\( \\|\$\\)|d" "$HOME/.config/gtk-3.0/bookmarks"
+  fi
+done
 
 gnome-extensions disable "$UUID" 2>/dev/null || true
 rm -rf "$DATA_HOME/gnome-shell/extensions/$UUID" "$DEST"

@@ -154,6 +154,39 @@ def lookup_keyring_password(username, logger, attempts=6, delay=5):
     return None
 
 
+def serve_signals(handlers):
+    """Run *handlers* ({signum: fn(signum)}) on a dedicated thread.
+
+    fuse-python's main loop never hands control back to Python on the main
+    thread, so handlers installed with signal.signal() would not run while
+    the filesystem is mounted. Instead block the signals here, before any
+    other thread starts (threads inherit the mask, libfuse's included), and
+    take them with sigwait().
+    """
+    signals = set(handlers)
+    signal.pthread_sigmask(signal.SIG_BLOCK, signals)
+
+    def loop():
+        while True:
+            signum = signal.sigwait(signals)
+            try:
+                handlers[signum](signum)
+            except Exception:
+                logging.getLogger("icloud").exception("Signal %s handler failed", signum)
+
+    threading.Thread(target=loop, name="icloud-signals", daemon=True).start()
+
+
+def stop_mounted(mountpoint, shutdown):
+    """SIGTERM: stop background work, then unmount so fs.main() returns."""
+    shutdown()
+    if mountpoint and os.path.ismount(mountpoint):
+        subprocess.run(["fusermount", "-uz", mountpoint], check=False)
+    else:
+        # Still starting up (e.g. the first crawl); nothing to unmount.
+        os._exit(0)
+
+
 class IgnoreIcdrsWarning(logging.Filter):
     def filter(self, record):
         return "ICDRS is not disabled; requestWebAccessState=" not in record.getMessage()
@@ -2325,17 +2358,16 @@ iCloud Linux: Mount iCloud Drive as a FUSE filesystem
     # reconcile uses Python's default handler which kills the process.
     atexit.register(fs.shutdown)
 
-    def handle_shutdown(signum, frame):
+    def handle_shutdown(signum):
         logger.info("Received signal %s, shutting down background sync", signum)
-        fs.shutdown()
-        raise SystemExit(0)
+        stop_mounted(fs.fuse_args.mountpoint, fs.shutdown)
 
     # SIGUSR1 — on-demand sync/refresh trigger (used by 'icloudctl sync' and 'icloudctl refresh').
     # Queues a one-shot remote crawl in a background thread so the signal
     # handler returns immediately and FUSE keeps serving requests.
     # If sync_engine is not ready yet (still reconciling), queues it to run
     # once the engine is available.
-    def handle_sigusr1(signum, frame):
+    def handle_sigusr1(signum):
         def _one_shot():
             # Wait up to 120s for the sync engine to be ready after startup
             deadline = time.time() + 120
@@ -2361,10 +2393,11 @@ iCloud Linux: Mount iCloud Drive as a FUSE filesystem
 
         threading.Thread(target=_one_shot, name="icloud-on-demand-sync", daemon=True).start()
 
-    signal.signal(signal.SIGTERM, handle_shutdown)
-    signal.signal(signal.SIGINT, handle_shutdown)
-    if hasattr(signal, "SIGUSR1"):
-        signal.signal(signal.SIGUSR1, handle_sigusr1)
+    serve_signals({
+        signal.SIGTERM: handle_shutdown,
+        signal.SIGINT: handle_shutdown,
+        signal.SIGUSR1: handle_sigusr1,
+    })
 
     fs.init_icloud(username, password, cache_dir, cookie_dir, require_session=interactive)
     fs.init_local_cache(

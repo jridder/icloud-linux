@@ -37,7 +37,7 @@ fi
 
 echo "Installing backend and app to $DEST"
 mkdir -p "$DEST/gnome"
-for f in driver.py auth.py hydrate.py hydrate_dir.py sync.py fix_filenames.py icloudctl \
+for f in driver.py photos.py auth.py hydrate.py hydrate_dir.py sync.py fix_filenames.py icloudctl \
          requirements.txt config.example.yaml README.md; do
   install -m "$( [[ -x "$SRC/$f" ]] && echo 755 || echo 644 )" "$SRC/$f" "$DEST/$f"
 done
@@ -108,6 +108,14 @@ if [[ -f "$HOME/.config/systemd/user/icloud.service" && -f "$HOME/.config/icloud
   "$DEST/icloudctl" init "${ICLOUD_MOUNT:-$HOME/iCloud}" >/dev/null
   [[ "$was_enabled" == enabled ]] || systemctl --user disable icloud.service >/dev/null 2>&1 || true
   echo "Updated icloud.service to use $DEST (restart it to pick up the new driver)."
+fi
+if [[ -f "$HOME/.config/systemd/user/icloud-photos.service" && -f "$HOME/.config/icloud-linux/photos.env" ]]; then
+  # shellcheck disable=SC1091
+  source "$HOME/.config/icloud-linux/photos.env"
+  was_enabled=$(systemctl --user is-enabled icloud-photos.service 2>/dev/null || true)
+  "$DEST/icloudctl" photos-init "${ICLOUD_PHOTOS_MOUNT:-$HOME/iCloud Photos}" >/dev/null
+  [[ "$was_enabled" == enabled ]] || systemctl --user disable icloud-photos.service >/dev/null 2>&1 || true
+  echo "Updated icloud-photos.service (restart it to pick up the new driver)."
 fi
 
 echo "Done. Open “iCloud Drive” from the app grid, or run: $BIN_DIR/icloud-drive"
