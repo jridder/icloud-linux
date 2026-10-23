@@ -13,6 +13,8 @@ const UNIT = 'icloud.service';
 const PHOTOS_UNIT = 'icloud-photos.service';
 const STATE_DIR = GLib.build_filenamev([GLib.get_home_dir(), '.local', 'state', 'icloud-linux']);
 const POLL_SECONDS = 5;
+const SYNC_FRAMES = 8;
+const FRAME_MS = 150;
 
 function run(argv) {
     return new Promise(resolve => {
@@ -148,8 +150,7 @@ class Indicator extends PanelMenu.Button {
     _update() {
         this._status = readStatus();
         const s = summarize(this._unit, this._status);
-        this._icon.gicon = Gio.FileIcon.new(this._extension.dir.resolve_relative_path(
-            `icons/${APP_ID}-${s.icon}-symbolic.svg`));
+        this._setIcon(s.icon);
         this._statusItem.label.text = `iCloud Drive: ${s.title}`;
         this._openItem.visible = !s.setup;
         this._openItem.setSensitive(Boolean(s.ready));
@@ -175,8 +176,38 @@ class Indicator extends PanelMenu.Button {
             Main.notify('iCloud Drive', 'The iCloud Drive app is not installed.');
     }
 
+    _iconFor(name) {
+        return Gio.FileIcon.new(this._extension.dir.resolve_relative_path(`icons/${APP_ID}-${name}-symbolic.svg`));
+    }
+
+    _setIcon(name) {
+        const animate = name === 'syncing' && St.Settings.get().enable_animations;
+        if (name === this._iconName && animate === Boolean(this._frameTimer))
+            return;
+        this._iconName = name;
+        this._stopAnimation();
+        this._icon.gicon = this._iconFor(name);
+        if (!animate)
+            return;
+        this._frames ??= [...Array(SYNC_FRAMES).keys()].map(i => this._iconFor(`syncing-${i}`));
+        let frame = 0;
+        this._frameTimer = GLib.timeout_add(GLib.PRIORITY_DEFAULT, FRAME_MS, () => {
+            frame = (frame + 1) % SYNC_FRAMES;
+            this._icon.gicon = this._frames[frame];
+            return GLib.SOURCE_CONTINUE;
+        });
+    }
+
+    _stopAnimation() {
+        if (this._frameTimer) {
+            GLib.source_remove(this._frameTimer);
+            this._frameTimer = 0;
+        }
+    }
+
     destroy() {
         this._destroyed = true;
+        this._stopAnimation();
         if (this._timer) {
             GLib.source_remove(this._timer);
             this._timer = 0;

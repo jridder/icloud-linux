@@ -86,7 +86,7 @@ echo "Installing GNOME Shell extension $UUID"
 rm -rf "$EXT_DIR"
 mkdir -p "$EXT_DIR/icons"
 install -m 644 "$SRC/gnome/extension/$UUID"/{metadata.json,extension.js,stylesheet.css} "$EXT_DIR/"
-install -m 644 "$SRC"/gnome/data/icons/*-symbolic.svg "$EXT_DIR/icons/"
+install -m 644 "$SRC"/gnome/data/icons/*-symbolic.svg "$SRC"/gnome/data/icons/sync-frames/*-symbolic.svg "$EXT_DIR/icons/"
 if ! gnome-extensions enable "$UUID" 2>/dev/null; then
   # The shell only scans for new extensions at login; pre-enable it for then.
   current="$(gsettings get org.gnome.shell enabled-extensions 2>/dev/null || echo "@as []")"
