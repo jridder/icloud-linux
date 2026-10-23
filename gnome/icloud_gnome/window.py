@@ -544,6 +544,8 @@ class MainPage(Adw.NavigationPage):
         menu = Gio.Menu()
         menu.append("Show Log", "win.show-log")
         menu.append("About iCloud Drive", "app.about")
+        # Only closes this window; the services keep syncing.
+        menu.append("Quit", "app.quit")
         menu_button = Gtk.MenuButton(icon_name="open-menu-symbolic", menu_model=menu,
                                      tooltip_text="Main Menu", primary=True)
 
