@@ -1,3 +1,4 @@
+import Clutter from 'gi://Clutter';
 import Gio from 'gi://Gio';
 import GLib from 'gi://GLib';
 import GObject from 'gi://GObject';
@@ -114,6 +115,16 @@ class Indicator extends PanelMenu.Button {
                 this._poll();
         });
 
+        // Right-click: a short menu to turn everything off (or back on).
+        this._contextMenu = new PopupMenu.PopupMenu(this, 0.0, St.Side.TOP);
+        this._contextMenu.actor.add_style_class_name('panel-menu');
+        this._contextMenu.actor.hide();
+        Main.uiGroup.add_child(this._contextMenu.actor);
+        Main.panel.menuManager.addMenu(this._contextMenu);
+        this._powerItem = this._contextMenu.addAction('', () => this._togglePower());
+        this._contextMenu.addMenuItem(new PopupMenu.PopupSeparatorMenuItem());
+        this._contextMenu.addAction('iCloud Drive Settings', () => this._launchApp());
+
         GLib.mkdir_with_parents(STATE_DIR, 0o755);
         this._monitor = Gio.File.new_for_path(STATE_DIR).monitor_directory(Gio.FileMonitorFlags.WATCH_MOVES, null);
         this._monitor.connect('changed', (_m, file) => {
@@ -125,6 +136,32 @@ class Indicator extends PanelMenu.Button {
             return GLib.SOURCE_CONTINUE;
         });
         this._poll();
+    }
+
+    vfunc_event(event) {
+        if (event.type() === Clutter.EventType.BUTTON_PRESS && event.get_button() === Clutter.BUTTON_SECONDARY) {
+            this.menu.close();
+            this._contextMenu.toggle();
+            return Clutter.EVENT_STOP;
+        }
+        return super.vfunc_event(event);
+    }
+
+    _anyRunning() {
+        return [this._unit, this._photosUnit].some(u => ['active', 'activating'].includes(u.ActiveState));
+    }
+
+    _togglePower() {
+        // Off stops both services (and unmounts); they come back at the next
+        // login, or right away from here.
+        if (this._anyRunning()) {
+            run(['systemctl', '--user', 'stop', UNIT, PHOTOS_UNIT]).then(() => this._poll());
+            return;
+        }
+        const units = [UNIT];
+        if (this._photosUnit.UnitFileState === 'enabled')
+            units.push(PHOTOS_UNIT);
+        run(['systemctl', '--user', 'start', ...units]).then(() => this._poll());
     }
 
     async _poll() {
@@ -161,6 +198,8 @@ class Indicator extends PanelMenu.Button {
         this._switch.visible = !s.setup;
         this._switch.setToggleState(['active', 'activating', 'reloading'].includes(this._unit.ActiveState));
         this._settingsItem.label.text = s.setup ? 'Set Up iCloud Drive…' : 'iCloud Drive Settings';
+        this._powerItem.label.text = this._anyRunning() ? 'Turn Off iCloud' : 'Turn On iCloud';
+        this._powerItem.visible = !s.setup;
     }
 
     _openFolder(status, fallback) {
@@ -214,6 +253,11 @@ class Indicator extends PanelMenu.Button {
         }
         this._monitor?.cancel();
         this._monitor = null;
+        if (this._contextMenu) {
+            Main.panel.menuManager.removeMenu(this._contextMenu);
+            this._contextMenu.destroy();
+            this._contextMenu = null;
+        }
         super.destroy();
     }
 });
