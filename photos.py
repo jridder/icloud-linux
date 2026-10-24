@@ -36,7 +36,16 @@ from collections import OrderedDict
 import fuse
 from fuse import Fuse
 
-from driver import StatusFile, lookup_keyring_password, parse_config, serve_signals, stop_mounted
+from driver import (
+    BACKUP_MARKERS,
+    StatusFile,
+    backup_marker_stat,
+    lookup_keyring_password,
+    parse_config,
+    read_backup_marker,
+    serve_signals,
+    stop_mounted,
+)
 
 fuse.fuse_python_api = (0, 2)
 
@@ -56,6 +65,8 @@ THUMBNAILERS = (
 )
 # Indexers would otherwise download the whole library for metadata.
 INDEXERS = ("localsearch-ext", "tracker-extract", "localsearch-3", "tracker-miner-f")
+# Bulk readers that may download originals, but never ahead of files a person opens.
+BACKUP_TOOLS = ("restic", "borg", "duplicity", "deja-dup", "kopia")
 
 
 # ── naming ──────────────────────────────────────────────────────────────────
@@ -224,7 +235,9 @@ class ICloudPhotosFS(Fuse):
         self.urls_lock = threading.Lock()
         self.path_locks = {}
         self.path_locks_lock = threading.Lock()
-        self.original_semaphore = threading.Semaphore(1)
+        # Separate lanes so a backup or the background warm-up never makes a
+        # file someone opens wait behind it.
+        self.download_lanes = {"user": threading.Semaphore(1), "background": threading.Semaphore(1)}
         self.preview_semaphore = threading.Semaphore(3)
         self.caller_cache = {}
         self.refresh_event = threading.Event()
@@ -406,7 +419,7 @@ class ICloudPhotosFS(Fuse):
         with self.path_locks_lock:
             return self.path_locks.setdefault(key, threading.Lock())
 
-    def ensure_cached(self, asset_id, kind):
+    def ensure_cached(self, asset_id, kind, lane="user"):
         """Download one resource if needed; return its local path."""
         target = self._cache_path(asset_id, kind)
         if os.path.exists(target):
@@ -419,7 +432,7 @@ class ICloudPhotosFS(Fuse):
             semaphore = self.preview_semaphore
         else:
             keys = ("original_video",) if kind == "live" else ("original",)
-            semaphore = self.original_semaphore
+            semaphore = self.download_lanes[lane]
         with self._path_lock((asset_id, kind)):
             if os.path.exists(target):
                 return target
@@ -452,7 +465,7 @@ class ICloudPhotosFS(Fuse):
             if self.stop_event.is_set() or self.refresh_event.is_set():
                 return
             try:
-                self.ensure_cached(asset_id, kind)
+                self.ensure_cached(asset_id, kind, lane="background")
             except Exception as exc:
                 self.logger.error("Background download failed for %s: %s", asset_id, exc)
             done += 1
@@ -461,7 +474,7 @@ class ICloudPhotosFS(Fuse):
     # callers ----------------------------------------------------------------
 
     def _caller_role(self):
-        """'thumbnailer', 'indexer' or 'user' for the process behind this request."""
+        """'thumbnailer', 'indexer', 'backup' or 'user' for the process behind this request."""
         try:
             pid = self.GetContext()["pid"]
         except Exception:
@@ -479,6 +492,8 @@ class ICloudPhotosFS(Fuse):
     # FUSE -------------------------------------------------------------------
 
     def getattr(self, path):
+        if path in BACKUP_MARKERS:
+            return backup_marker_stat(path)
         node = self.tree.get(path)
         if node is None:
             return -errno.ENOENT
@@ -492,9 +507,14 @@ class ICloudPhotosFS(Fuse):
         node = self.tree.get(path)
         if node is None or node[0] != "dir":
             return -errno.ENOENT
-        return [fuse.Direntry(name) for name in [".", ".."] + node[1]]
+        names = [".", ".."] + node[1]
+        if path == "/":
+            names += [name[1:] for name in BACKUP_MARKERS]
+        return [fuse.Direntry(name) for name in names]
 
     def open(self, path, flags):
+        if path in BACKUP_MARKERS:
+            return -errno.EROFS if flags & (os.O_WRONLY | os.O_RDWR | os.O_TRUNC | os.O_APPEND) else 0
         node = self.tree.get(path)
         if node is None or node[0] != "file":
             return -errno.ENOENT
@@ -511,7 +531,7 @@ class ICloudPhotosFS(Fuse):
                 self.ensure_cached(asset_id, "preview")
                 # Bypass the page cache so the preview never shadows the original.
                 return fuse.FuseFileInfo(direct_io=True)
-            self.ensure_cached(asset_id, kind)
+            self.ensure_cached(asset_id, kind, lane="background" if role == "backup" else "user")
         except PermissionError:
             return -errno.EACCES
         except Exception as exc:
@@ -520,6 +540,8 @@ class ICloudPhotosFS(Fuse):
         return 0
 
     def read(self, path, size, offset):
+        if path in BACKUP_MARKERS:
+            return read_backup_marker(path, size, offset)
         node = self.tree.get(path)
         if node is None or node[0] != "file":
             return -errno.ENOENT
@@ -527,11 +549,12 @@ class ICloudPhotosFS(Fuse):
         local = self._cache_path(asset_id, kind)
         if not os.path.exists(local):
             preview = self._cache_path(asset_id, "preview")
-            if self._caller_role() == "thumbnailer" and os.path.exists(preview):
+            role = self._caller_role()
+            if role == "thumbnailer" and os.path.exists(preview):
                 local = preview
             else:
                 try:
-                    local = self.ensure_cached(asset_id, kind)
+                    local = self.ensure_cached(asset_id, kind, lane="background" if role == "backup" else "user")
                 except Exception as exc:
                     self.logger.error("Could not download %s: %s", path, exc)
                     return -errno.EIO
@@ -558,6 +581,8 @@ def classify_process(pid):
             return "thumbnailer"
         if comm.startswith(INDEXERS):
             return "indexer"
+        if comm.startswith(BACKUP_TOOLS):
+            return "backup"
         if ppid <= 1:
             return "user"
         pid = ppid
@@ -587,6 +612,8 @@ def main():
     fs.status.update(phase="starting", mountpoint=fs.fuse_args.mountpoint)
 
     config = parse_config(options.config)
+    if not config.get("backup_markers", True):
+        BACKUP_MARKERS.clear()
     username = config.get("username")
     if not username:
         fs.logger.error("Username not provided in config file")

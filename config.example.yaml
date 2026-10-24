@@ -31,6 +31,11 @@ warmup_workers: 1
 # File downloads stay one at a time (warmup_workers). Set 1 if Apple pushes back.
 crawl_workers: 3
 
+# Put CACHEDIR.TAG and .deja-dup-ignore at the root of the mounts so backup
+# tools (Déjà Dup, restic/borg/tar --exclude-caches) skip them; backing up a
+# mount downloads every file. Set false to include your iCloud files in backups.
+backup_markers: true
+
 # Persistent cookie/session directory used after one-time 2FA bootstrap
 cookie_dir: "~/.config/icloud-linux/cookies"
 

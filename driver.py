@@ -88,6 +88,34 @@ class Stat(fuse.Stat):
         self.st_ctime = 0
 
 
+# Virtual read-only files at the mount root that tell backup tools to skip
+# the mount: walking it would download everything. CACHEDIR.TAG is the
+# cross-tool standard (restic/borg/tar --exclude-caches); Déjà Dup also
+# checks .deja-dup-ignore.
+BACKUP_MARKERS = {
+    "/CACHEDIR.TAG": (
+        b"Signature: 8a477f597d28d172789f06886806bc55\n"
+        b"# This folder is an iCloud mount (icloud-linux). Backup tools that honor\n"
+        b"# CACHEDIR.TAG skip it, since reading it would download every file.\n"
+    ),
+    "/.deja-dup-ignore": b"",
+}
+
+
+def backup_marker_stat(path):
+    attrs = Stat()
+    attrs.st_mode = stat.S_IFREG | 0o444
+    attrs.st_nlink = 1
+    attrs.st_uid = os.getuid()
+    attrs.st_gid = os.getgid()
+    attrs.st_size = len(BACKUP_MARKERS[path])
+    return attrs
+
+
+def read_backup_marker(path, size, offset):
+    return BACKUP_MARKERS[path][offset:offset + size]
+
+
 class StatusFile:
     """Machine-readable service status for desktop front ends.
 
@@ -1775,6 +1803,8 @@ class ICloudFS(Fuse):
         self.logger.log(level, "file-op %s", op)
 
     def _mutation_allowed(self, operation, *paths):
+        if any(path in BACKUP_MARKERS for path in paths):
+            return False
         if self.sync_engine is None:
             self._log_file_op(
                 operation,
@@ -1944,6 +1974,8 @@ class ICloudFS(Fuse):
         self.sync_engine.start()
 
     def getattr(self, path):
+        if path in BACKUP_MARKERS:
+            return backup_marker_stat(path)
         now = int(time.time())
         entry = self.state.get_entry(path) if self.state else None
         attrs = Stat()
@@ -1992,10 +2024,14 @@ class ICloudFS(Fuse):
 
         self._log_file_op("readdir", path, level=logging.DEBUG)
         entries = [".", ".."] + sorted(self.mirror.listdir(path))
+        if path == "/":
+            entries += [name[1:] for name in BACKUP_MARKERS if name[1:] not in entries]
         for entry in entries:
             yield fuse.Direntry(entry)
 
     def open(self, path, flags):
+        if path in BACKUP_MARKERS:
+            return -errno.EACCES if flags & (os.O_WRONLY | os.O_RDWR | os.O_APPEND | os.O_TRUNC) else 0
         self._log_file_op("open", path, level=logging.DEBUG, flags=flags)
         if flags & (os.O_CREAT | os.O_WRONLY | os.O_RDWR | os.O_APPEND | os.O_TRUNC):
             if not self._is_authenticated() or not self._mutation_allowed("open", path):
@@ -2051,6 +2087,8 @@ class ICloudFS(Fuse):
             return -errno.EIO
 
     def read(self, path, size, offset):
+        if path in BACKUP_MARKERS:
+            return read_backup_marker(path, size, offset)
         entry = self.state.get_entry(path)
         if not entry or entry["type"] != "file" or entry["tombstone"]:
             return -errno.ENOENT
@@ -2381,6 +2419,8 @@ iCloud Linux: Mount iCloud Drive as a FUSE filesystem
     logging.getLogger("pyicloud.base").addFilter(IgnoreIcdrsWarning())
 
     config = parse_config(args.config)
+    if not config.get("backup_markers", True):
+        BACKUP_MARKERS.clear()
     username = config.get("username")
     password = config.get("password")
     if username and not password:

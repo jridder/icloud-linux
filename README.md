@@ -32,6 +32,10 @@ Important behavior:
 - Failed warmup downloads are retried automatically with backoff.
 - The first run mounts immediately; folders fill in as the first scan finds them.
 - Scans list up to `crawl_workers` folders at once (default 3); downloads stay serialized.
+- Both mounts put `CACHEDIR.TAG` and `.deja-dup-ignore` at their root so backup tools
+  skip them (backing up a mount downloads every file). Set `backup_markers: false` to
+  back them up anyway; Photos then serves backup reads in their own download lane so
+  files you open never wait behind a backup.
 - If a path changed both locally and remotely, the local version is preserved as a conflict copy instead of being silently overwritten.
 - With `auto_sync: false`, the driver starts and mounts immediately without spawning background polling threads. Run `icloudctl sync` when you want a fresh pull from iCloud.
 

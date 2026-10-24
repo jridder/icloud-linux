@@ -94,6 +94,11 @@ class CallerTests(unittest.TestCase):
         with self.fake_proc(table):
             self.assertEqual(classify_process(30), "user")
 
+    def test_backup_tool_launched_by_deja_dup(self):
+        table = {40: ("restic", 30), 30: ("deja-dup", 1)}
+        with self.fake_proc(table):
+            self.assertEqual(classify_process(40), "backup")
+
     def test_indexer(self):
         with self.fake_proc({7: ("localsearch-ext", 1)}):
             self.assertEqual(classify_process(7), "indexer")
