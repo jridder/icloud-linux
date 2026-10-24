@@ -895,7 +895,7 @@ class ICloudSyncEngine:
         self.scheduled_downloads = set()
         self.downloads_lock = threading.Lock()
         self.download_retry_attempts = {}
-        # path -> etag of files iCloud refuses to serve (e.g. Mac packages)
+        # path -> etag of files iCloud refused with 421 (needs a fresh sign-in)
         self.unservable = {}
         self.download_retry_timers = {}
         self.threads = []
@@ -1434,11 +1434,13 @@ class ICloudSyncEngine:
 
     @staticmethod
     def _is_refused_item(exc):
-        """Apple answers 421 for items its web API can't serve as one file.
+        """Apple answered 421 "Authentication required" for this one item.
 
-        Mac packages (.app, .xcodeproj, .pxm, .playgroundbook…) are folders on a
-        Mac, and they fail this way every time. Retrying only piles up refused
-        requests on the account, so these are skipped, not retried.
+        Seen for Mac packages (.app, .xcodeproj, .pxm, …) once a session had
+        aged, while ordinary files still downloaded; after a fresh sign-in they
+        downloaded fine. Retrying with the same session only piles refused
+        requests onto the account, so the item waits for a restart (new
+        session) or a remote change instead.
         """
         return isinstance(exc, PyiCloudAPIResponseException) and str(getattr(exc, "code", "")) == "421"
 
@@ -1467,6 +1469,8 @@ class ICloudSyncEngine:
             self._log_sync("download-complete", level=logging.INFO, path=path)
             with self.hydration_progress_lock:
                 self.hydration_completed += 1
+                # Downloads queued after startup (new remote files) add to the total.
+                self.hydration_total = max(self.hydration_total, self.hydration_completed)
                 completed = self.hydration_completed
                 total = self.hydration_total
             STATUS.update(force=completed == total, hydration={"completed": completed, "total": total})
@@ -1494,8 +1498,8 @@ class ICloudSyncEngine:
                 with self.downloads_lock:
                     self.download_retry_attempts.pop(path, None)
                 self.logger.warning(
-                    "iCloud won't serve %s (%s); skipping it until it changes. "
-                    "Mac packages like .app or .xcodeproj can't be downloaded this way.",
+                    "iCloud refused %s (%s); skipping it until it changes or the service "
+                    "restarts. Signing in again usually makes it downloadable.",
                     path,
                     exc,
                 )
