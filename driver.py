@@ -102,6 +102,9 @@ BACKUP_MARKERS = {
         b"# CACHEDIR.TAG skip it, since reading it would download every file.\n"
     ),
     "/.deja-dup-ignore": b"",
+    # Files and GTK file dialogs hide names listed in .hidden; the marker has
+    # to keep its exact name for backup tools to recognize it.
+    "/.hidden": b"CACHEDIR.TAG\n",
 }
 
 
