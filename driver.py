@@ -43,6 +43,9 @@ fuse.fuse_python_api = (0, 2)
 ROOT_DRIVEWSID = "FOLDER::com.apple.CloudDocs::root"
 DIRECTORY_NODE_TYPES = {"folder", "app_library"}
 IO_CHUNK_SIZE = 1024 * 1024
+# Give up on a file after this many failed background downloads, until it
+# changes remotely or the service restarts.
+MAX_DOWNLOAD_ATTEMPTS = 5
 
 
 def normalize_icloud_path(path):
@@ -892,6 +895,8 @@ class ICloudSyncEngine:
         self.scheduled_downloads = set()
         self.downloads_lock = threading.Lock()
         self.download_retry_attempts = {}
+        # path -> etag of files iCloud refuses to serve (e.g. Mac packages)
+        self.unservable = {}
         self.download_retry_timers = {}
         self.threads = []
         self.hydration_total = 0
@@ -1380,6 +1385,11 @@ class ICloudSyncEngine:
     def _schedule_download_with_delay(self, path, delay_seconds):
         if not self._path_allowed(path):
             return
+        if path in self.unservable:
+            entry = self.state.get_entry(path)
+            if entry is not None and entry.get("remote_etag") == self.unservable[path]:
+                return
+            self.unservable.pop(path, None)  # changed remotely; try again
         if self.stop_event.is_set() or self.is_shutdown:
             return
 
@@ -1421,6 +1431,16 @@ class ICloudSyncEngine:
         except RuntimeError:
             with self.downloads_lock:
                 self.scheduled_downloads.discard(path)
+
+    @staticmethod
+    def _is_refused_item(exc):
+        """Apple answers 421 for items its web API can't serve as one file.
+
+        Mac packages (.app, .xcodeproj, .pxm, .playgroundbook…) are folders on a
+        Mac, and they fail this way every time. Retrying only piles up refused
+        requests on the account, so these are skipped, not retried.
+        """
+        return isinstance(exc, PyiCloudAPIResponseException) and str(getattr(exc, "code", "")) == "421"
 
     def _retry_delay_for_attempt(self, attempt):
         return min(300, 5 * (2 ** max(0, attempt - 1)))
@@ -1468,9 +1488,29 @@ class ICloudSyncEngine:
                 with self.downloads_lock:
                     self.download_retry_attempts.pop(path, None)
                 return
+            if self._is_refused_item(exc):
+                entry = self.state.get_entry(path)
+                self.unservable[path] = entry.get("remote_etag") if entry else None
+                with self.downloads_lock:
+                    self.download_retry_attempts.pop(path, None)
+                self.logger.warning(
+                    "iCloud won't serve %s (%s); skipping it until it changes. "
+                    "Mac packages like .app or .xcodeproj can't be downloaded this way.",
+                    path,
+                    exc,
+                )
+                return
             with self.downloads_lock:
                 attempt = self.download_retry_attempts.get(path, 0) + 1
                 self.download_retry_attempts[path] = attempt
+            if attempt >= MAX_DOWNLOAD_ATTEMPTS:
+                self.logger.error(
+                    "Warmup download failed for %s (attempt %s): %s; giving up until it changes or the service restarts",
+                    path,
+                    attempt,
+                    exc,
+                )
+                return
             retry_delay = self._retry_delay_for_attempt(attempt)
             self.logger.error(
                 "Warmup download failed for %s (attempt %s): %s; retrying in %ss",

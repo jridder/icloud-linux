@@ -914,6 +914,45 @@ class ICloudFSPathPolicyTests(unittest.TestCase):
             engine.shutdown()
 
 
+class DownloadRetryTests(unittest.TestCase):
+    """Replays the overnight case: Mac packages refused with 421 were retried forever."""
+
+    def setUp(self):
+        self.root = tempfile.mkdtemp(prefix="icloud-linux-test-")
+        self.addCleanup(shutil.rmtree, self.root)
+        self.state = SyncState(os.path.join(self.root, "state.sqlite3"))
+        self.engine = ICloudSyncEngine(Mock(), LocalMirror(self.root), self.state, Mock())
+        self.engine._schedule_download_with_delay = Mock(wraps=self.engine._schedule_download_with_delay)
+        self.engine.executor = Mock()
+        for path in ("/App.app", "/flaky.txt"):
+            self.state.upsert_entry({"path": path, "type": "file", "parent_path": "/", "remote_etag": "e1",
+                                     "remote_drivewsid": "FILE::" + path, "size": 5, "hydrated": False})
+
+    def fail_with(self, exc):
+        self.engine.ensure_local_file = Mock(side_effect=exc)
+
+    def retries(self):
+        return [c for c in self.engine._schedule_download_with_delay.call_args_list if c.args[1] > 0]
+
+    def test_refused_item_is_not_retried_until_it_changes(self):
+        self.fail_with(PyiCloudAPIResponseException("Authentication required for Account.", 421))
+        self.engine._download_job("/App.app")
+        self.assertEqual(self.retries(), [])
+        self.engine._schedule_download("/App.app")
+        self.engine.executor.submit.assert_not_called()  # still skipped
+
+        self.state.upsert_entry({**self.state.get_entry("/App.app"), "remote_etag": "e2"})
+        self.engine._schedule_download("/App.app")
+        self.engine.executor.submit.assert_called_once()  # changed remotely: try again
+
+    def test_other_failures_stop_after_the_attempt_cap(self):
+        self.fail_with(RuntimeError("network down"))
+        for _ in range(10):
+            self.engine.scheduled_downloads.discard("/flaky.txt")
+            self.engine._download_job("/flaky.txt")
+        self.assertEqual(len(self.retries()), driver.MAX_DOWNLOAD_ATTEMPTS - 1)
+
+
 class FakeNode:
     """Drive folder whose listing takes *delay* seconds, like a round-trip."""
 
