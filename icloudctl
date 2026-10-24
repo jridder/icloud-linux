@@ -12,6 +12,10 @@ SERVICE_FILE="$SERVICE_DIR/icloud.service"
 PHOTOS_SERVICE_FILE="$SERVICE_DIR/icloud-photos.service"
 PHOTOS_ENV_FILE="$CONFIG_DIR/photos.env"
 PHOTOS_MOUNT_DEFAULT="$HOME/iCloud Photos"
+# The real mount points live under a dot directory so GNOME doesn't list them
+# as drives; the folders you pick are links to them. Kept outside REPO_DIR so
+# removing the install can never recurse into a live mount.
+MOUNTS_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/icloud-linux-mounts"
 MOUNT_DIR_DEFAULT="$HOME/iCloud"
 
 need_cmd() { command -v "$1" >/dev/null 2>&1 || { echo "Missing required command: $1"; exit 1; }; }
@@ -114,13 +118,49 @@ WantedBy=default.target
 EOF
 }
 
+# link_mount_dir LINK NAME: make LINK a symlink to $MOUNTS_DIR/NAME; print the target.
+link_mount_dir() {
+  local link="$1" real="$MOUNTS_DIR/$2"
+  reject_control_chars "mount dir" "$link"
+  mkdir -p "$real"
+  if [[ -L "$link" ]]; then
+    ln -sfn "$real" "$link"
+  elif [[ -d "$link" ]]; then
+    if mountpoint -q "$link"; then
+      echo "$link is still mounted; stop the service first" >&2
+      exit 1
+    fi
+    if ! rmdir "$link" 2>/dev/null; then
+      echo "$link is not empty; move its contents elsewhere and try again" >&2
+      exit 1
+    fi
+    ln -s "$real" "$link"
+  elif [[ -e "$link" ]]; then
+    echo "$link exists and is not a folder" >&2
+    exit 1
+  else
+    mkdir -p "$(dirname "$link")"
+    ln -s "$real" "$link"
+  fi
+  printf '%s' "$real"
+}
+
+# unlink_mount_dir LINK: remove LINK if it is one of our links, and its empty mount point.
+unlink_mount_dir() {
+  local link="$1" real
+  [[ -L "$link" ]] || return 0
+  real="$(readlink "$link")"
+  [[ "$real" == "$MOUNTS_DIR/"* ]] || return 0
+  rm -f "$link"
+  mountpoint -q "$real" || rmdir "$real" 2>/dev/null || true
+}
+
 write_env() {
-  local mount_dir="${1:-$MOUNT_DIR_DEFAULT}"
-  mkdir -p "$mount_dir"
-  reject_control_chars "mount dir" "$mount_dir"
+  local mount_dir="$1" real="$2"
   {
     printf 'ICLOUD_CONFIG=%q\n' "$CONFIG_FILE"
     printf 'ICLOUD_MOUNT=%q\n' "$mount_dir"
+    printf 'ICLOUD_MOUNT_REAL=%q\n' "$real"
   } > "$ENV_FILE"
   chmod 600 "$ENV_FILE"
 }
@@ -134,7 +174,7 @@ load_env_if_present() {
 
 cleanup_mountpoint() {
   load_env_if_present
-  local mount_dir="${1:-${ICLOUD_MOUNT:-$MOUNT_DIR_DEFAULT}}"
+  local mount_dir="${1:-${ICLOUD_MOUNT_REAL:-${ICLOUD_MOUNT:-$MOUNT_DIR_DEFAULT}}}"
   mkdir -p "$mount_dir"
 
   if mountpoint -q "$mount_dir"; then
@@ -157,23 +197,24 @@ cmd_init() {
   ensure_venv
   create_config_if_missing
 
-  mkdir -p "$mount_dir"
-  if [[ ! -w "$mount_dir" ]]; then
-    local fallback="$HOME/iCloudDrive"
-    mkdir -p "$fallback"
-    if [[ -w "$fallback" ]]; then
-      echo "Mount dir not writable: $mount_dir"
-      echo "Using fallback mount dir: $fallback"
-      mount_dir="$fallback"
-    else
-      echo "Mount dir is not writable: $mount_dir"
-      echo "Fix with: sudo chown -R $USER:$USER '$mount_dir'"
-      exit 1
-    fi
+  local parent
+  parent="$(dirname "$mount_dir")"
+  mkdir -p "$parent"
+  if [[ ! -w "$parent" ]]; then
+    echo "Can't create $mount_dir: $parent is not writable"
+    exit 1
   fi
 
-  write_env "$mount_dir"
-  write_service "$mount_dir"
+  # Moving to a new folder: drop the link at the old one.
+  load_env_if_present
+  if [[ -n "${ICLOUD_MOUNT:-}" && "$ICLOUD_MOUNT" != "$mount_dir" ]]; then
+    unlink_mount_dir "$ICLOUD_MOUNT"
+  fi
+
+  local real
+  real="$(link_mount_dir "$mount_dir" "iCloud Drive")"
+  write_env "$mount_dir" "$real"
+  write_service "$real"
   systemctl --user daemon-reload
   systemctl --user enable icloud.service >/dev/null
   echo "Initialized."
@@ -188,11 +229,22 @@ cmd_photos_init() {
   need_cmd systemctl
   ensure_dirs
   ensure_venv
-  reject_control_chars "mount dir" "$mount_dir"
-  mkdir -p "$mount_dir"
-  printf 'ICLOUD_PHOTOS_MOUNT=%q\n' "$mount_dir" > "$PHOTOS_ENV_FILE"
+  if [[ -f "$PHOTOS_ENV_FILE" ]]; then
+    local ICLOUD_PHOTOS_MOUNT=""
+    # shellcheck disable=SC1090
+    source "$PHOTOS_ENV_FILE"
+    if [[ -n "$ICLOUD_PHOTOS_MOUNT" && "$ICLOUD_PHOTOS_MOUNT" != "$mount_dir" ]]; then
+      unlink_mount_dir "$ICLOUD_PHOTOS_MOUNT"
+    fi
+  fi
+  local real
+  real="$(link_mount_dir "$mount_dir" "iCloud Photos")"
+  {
+    printf 'ICLOUD_PHOTOS_MOUNT=%q\n' "$mount_dir"
+    printf 'ICLOUD_PHOTOS_MOUNT_REAL=%q\n' "$real"
+  } > "$PHOTOS_ENV_FILE"
   chmod 600 "$PHOTOS_ENV_FILE"
-  write_photos_service "$mount_dir"
+  write_photos_service "$real"
   systemctl --user daemon-reload
   systemctl --user enable icloud-photos.service >/dev/null
   echo "Initialized iCloud Photos at $mount_dir"
@@ -202,6 +254,12 @@ cmd_photos_init() {
 cmd_photos_uninstall() {
   systemctl --user stop icloud-photos.service >/dev/null 2>&1 || true
   systemctl --user disable icloud-photos.service >/dev/null 2>&1 || true
+  if [[ -f "$PHOTOS_ENV_FILE" ]]; then
+    local ICLOUD_PHOTOS_MOUNT=""
+    # shellcheck disable=SC1090
+    source "$PHOTOS_ENV_FILE"
+    [[ -n "$ICLOUD_PHOTOS_MOUNT" ]] && unlink_mount_dir "$ICLOUD_PHOTOS_MOUNT"
+  fi
   rm -f "$PHOTOS_SERVICE_FILE" "$PHOTOS_ENV_FILE"
   systemctl --user daemon-reload
   systemctl --user reset-failed icloud-photos.service >/dev/null 2>&1 || true
@@ -286,6 +344,8 @@ cmd_uninstall() {
   cmd_photos_uninstall >/dev/null
   systemctl --user stop icloud.service >/dev/null 2>&1 || true
   systemctl --user disable icloud.service >/dev/null 2>&1 || true
+  load_env_if_present
+  [[ -n "${ICLOUD_MOUNT:-}" ]] && unlink_mount_dir "$ICLOUD_MOUNT"
   rm -f "$SERVICE_FILE"
   systemctl --user daemon-reload
   systemctl --user reset-failed >/dev/null 2>&1 || true

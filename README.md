@@ -30,6 +30,11 @@ Important behavior:
 - Restarts reuse the existing cache instead of starting from zero.
 - If you open a file before it has finished hydrating, that file is downloaded first and then served locally.
 - Failed warmup downloads are retried automatically with backoff.
+- The mounts live under `~/.local/share/icloud-linux-mounts/`; the folders you pick
+  (`~/iCloud`, `~/iCloud Photos`) are links to them. That keeps GNOME from listing
+  them as removable drives, and backups and indexers don't follow the links.
+- Restarts mount immediately too: checking the local cache runs in the background, and
+  changes made meanwhile wait until it finishes.
 - The first run mounts immediately; folders fill in as the first scan finds them.
 - Scans list up to `crawl_workers` folders at once (default 3); downloads stay serialized.
 - Both mounts put `CACHEDIR.TAG` and `.deja-dup-ignore` at their root so backup tools

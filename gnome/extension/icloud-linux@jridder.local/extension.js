@@ -31,6 +31,20 @@ function run(argv) {
     });
 }
 
+// The folder the user picked (a link to the real, hidden mount point), from
+// the env file icloudctl writes with printf %q.
+function userFolder(envFile, variable, fallback) {
+    try {
+        const path = GLib.build_filenamev([GLib.get_home_dir(), '.config', 'icloud-linux', envFile]);
+        const [, bytes] = GLib.file_get_contents(path);
+        const match = new TextDecoder().decode(bytes).match(new RegExp(`^${variable}=(.*)$`, 'm'));
+        if (match)
+            return match[1].replace(/\\(.)/g, '$1');
+    } catch (e) {
+    }
+    return GLib.build_filenamev([GLib.get_home_dir(), fallback]);
+}
+
 function readStatus(name = 'status.json') {
     try {
         const [, bytes] = GLib.file_get_contents(GLib.build_filenamev([STATE_DIR, name]));
@@ -61,7 +75,7 @@ function summarize(unit, status) {
     if (status.phase === 'scanning')
         return {icon: 'syncing', title: `Scanning… ${(crawl.entries ?? 0).toLocaleString()} items`, browsable: true};
     if (status.phase === 'reconciling')
-        return {icon: 'syncing', title: 'Checking downloaded files…'};
+        return {icon: 'syncing', title: 'Checking downloaded files…', browsable: true};
     if (status.phase === 'stopped')
         return {icon: 'off', title: 'Stopping…'};
     if (status.uploading)
@@ -94,8 +108,10 @@ class Indicator extends PanelMenu.Button {
         this.menu.addMenuItem(this._statusItem);
         this.menu.addMenuItem(new PopupMenu.PopupSeparatorMenuItem());
 
-        this._openItem = this.menu.addAction('Open iCloud Drive', () => this._openFolder(this._status, 'iCloud'));
-        this._photosItem = this.menu.addAction('Open iCloud Photos', () => this._openFolder(readStatus('photos-status.json'), 'iCloud Photos'));
+        this._openItem = this.menu.addAction('Open iCloud Drive', () =>
+            this._openFolder(userFolder('icloud.env', 'ICLOUD_MOUNT', 'iCloud')));
+        this._photosItem = this.menu.addAction('Open iCloud Photos', () =>
+            this._openFolder(userFolder('photos.env', 'ICLOUD_PHOTOS_MOUNT', 'iCloud Photos')));
         this._syncItem = this.menu.addAction('Sync Now', () => {
             const units = this._photosUnit.ActiveState === 'active' ? [UNIT, PHOTOS_UNIT] : [UNIT];
             run(['systemctl', '--user', 'kill', '--kill-whom=main', '--signal=SIGUSR1', ...units]).then(() => this._poll());
@@ -202,9 +218,8 @@ class Indicator extends PanelMenu.Button {
         this._powerItem.visible = !s.setup;
     }
 
-    _openFolder(status, fallback) {
-        const mount = status.mountpoint || GLib.build_filenamev([GLib.get_home_dir(), fallback]);
-        Gio.AppInfo.launch_default_for_uri(Gio.File.new_for_path(mount).get_uri(), global.create_app_launch_context(0, -1));
+    _openFolder(folder) {
+        Gio.AppInfo.launch_default_for_uri(Gio.File.new_for_path(folder).get_uri(), global.create_app_launch_context(0, -1));
     }
 
     _launchApp() {

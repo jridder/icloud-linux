@@ -477,6 +477,8 @@ class SyncEngineStartupTests(unittest.TestCase):
         )
 
         self.engine.start()
+        self.assertTrue(self.engine.ready.wait(10))
+        self.engine.reconcile.join(timeout=10)
 
         self.engine.initial_scan.assert_not_called()
         self.engine._reconcile_persistent_cache.assert_called_once()
@@ -912,6 +914,18 @@ class ICloudFSPathPolicyTests(unittest.TestCase):
             self.assertTrue(engine._path_allowed("/outside/file.txt"))
         finally:
             engine.shutdown()
+
+
+class ReconcileGateTests(unittest.TestCase):
+    def test_changes_wait_until_reconcile_finishes(self):
+        fs = ICloudFS()
+        fs.sync_engine = Mock()
+        fs.sync_engine._path_allowed.return_value = True
+        fs.sync_engine.ready = threading.Event()  # reconciling
+        threading.Timer(0.3, fs.sync_engine.ready.set).start()
+        started = time.time()
+        self.assertTrue(fs._mutation_allowed("write", "/notes.txt"))
+        self.assertGreaterEqual(time.time() - started, 0.25)
 
 
 class DownloadRetryTests(unittest.TestCase):

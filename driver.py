@@ -887,6 +887,9 @@ class ICloudSyncEngine:
         self.auto_sync = bool(auto_sync)
         self.crawl_workers = max(1, int(crawl_workers))
         self.first_scan = None  # thread running the very first crawl, if any
+        # Cleared while reconciling; changes through the mount wait for it.
+        self.ready = threading.Event()
+        self.ready.set()
         # An empty sync_paths value preserves unrestricted syncing.
         self.sync_paths = normalize_icloud_paths(sync_paths) or None
         self.exclude_paths = normalize_icloud_paths(exclude_paths)
@@ -923,19 +926,30 @@ class ICloudSyncEngine:
         self.logger.log(level, "sync %s", event)
 
     def start(self):
+        # Both paths return at once so the filesystem mounts right away.
         if self.has_persistent_cache():
             self.logger.info("Using persistent local cache from %s", self.mirror.root)
             STATUS.update(phase="reconciling")
-            self._reconcile_persistent_cache()
-            if self.warmup_mode == "background":
-                self._schedule_all_unhydrated()
+            self.ready.clear()
+            self.reconcile = threading.Thread(target=self._run_reconcile, name="icloud-reconcile", daemon=True)
+            self.reconcile.start()
         else:
-            # Mount right away and show folders as the crawl finds them.
+            # Show folders as the first crawl finds them; nothing to reconcile.
             self.logger.info("Persistent cache not initialized yet; first remote crawl runs in the background")
             STATUS.update(phase="scanning")
             self.first_scan = threading.Thread(target=self._run_first_scan, name="icloud-first-scan", daemon=True)
             self.first_scan.start()
-            return
+
+    def _run_reconcile(self):
+        try:
+            self._reconcile_persistent_cache()
+            if self.warmup_mode == "background":
+                self._schedule_all_unhydrated()
+        except Exception as exc:
+            self.logger.error("Reconciling the local cache failed: %s", exc)
+        finally:
+            self.ready.set()
+            STATUS.update(phase="ready")
         self._after_initial_state()
 
     def _after_initial_state(self):
@@ -1016,7 +1030,9 @@ class ICloudSyncEngine:
 
         for entry in entries:
             path = entry["path"]
-            if entry["tombstone"]:
+            # The mount is already serving; downloads may have updated this row.
+            entry = self.state.get_entry(path)
+            if entry is None or entry["tombstone"]:
                 continue
             if self._is_directory_type(entry["type"]):
                 if not self.mirror.is_dir(path):
@@ -1852,6 +1868,9 @@ class ICloudFS(Fuse):
     def _mutation_allowed(self, operation, *paths):
         if any(path in BACKUP_MARKERS for path in paths):
             return False
+        if self.sync_engine is not None and not self.sync_engine.ready.wait(timeout=600):
+            self._log_file_op(operation, level=logging.WARNING, reason="still-reconciling")
+            return False
         if self.sync_engine is None:
             self._log_file_op(
                 operation,
@@ -1877,6 +1896,8 @@ class ICloudFS(Fuse):
             phase = "unauthenticated"
         elif self.sync_engine is not None and self.sync_engine.first_scan is not None:
             phase = "scanning"
+        elif self.sync_engine is not None and not self.sync_engine.ready.is_set():
+            phase = "reconciling"
         else:
             phase = "ready"
         STATUS.update(phase=phase, mountpoint=self.fuse_args.mountpoint)
@@ -2520,8 +2541,8 @@ iCloud Linux: Mount iCloud Drive as a FUSE filesystem
             if fs.sync_engine is None:
                 logger.warning("SIGUSR1: sync engine not available (unauthenticated or startup failed)")
                 return
-            if fs.sync_engine.first_scan is not None:
-                logger.info("SIGUSR1: first remote crawl still running; skipping on-demand crawl")
+            if fs.sync_engine.first_scan is not None or not fs.sync_engine.ready.is_set():
+                logger.info("SIGUSR1: still starting up; skipping on-demand crawl")
                 return
             logger.info("SIGUSR1: starting on-demand remote metadata crawl")
             try:

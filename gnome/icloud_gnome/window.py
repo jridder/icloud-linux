@@ -63,7 +63,8 @@ def summarize(service, status, config):
         return ("io.github.jridder.ICloudLinux-syncing-symbolic", "Scanning iCloud Drive…",
                 f"{entries:,} items found so far — folders fill in as they’re found", None, "accent")
     if phase == "reconciling":
-        return ("io.github.jridder.ICloudLinux-syncing-symbolic", "Checking Downloaded Files…", None, None, "accent")
+        return ("io.github.jridder.ICloudLinux-syncing-symbolic", "Checking Downloaded Files…",
+                "You can already browse your files", None, "accent")
     if phase == "stopped":
         return ("content-loading-symbolic", "Stopping…", None, None, "dimmed")
 
@@ -510,7 +511,7 @@ class PathListGroup(Adw.PreferencesGroup):
 
     def _add(self, *_):
         root = backend.mount_dir()
-        if not os.path.ismount(root):
+        if not os.path.ismount(os.path.realpath(root)):  # root is a link to the mount
             root = backend.mirror_dir()  # service off: browse the cached tree
         dialog = Gtk.FileDialog(title="Choose an iCloud Drive Folder", accept_label="Add")
         dialog.set_initial_folder(Gio.File.new_for_path(str(root)))
@@ -636,7 +637,7 @@ class MainPage(Adw.NavigationPage):
         needs_auth = fresh and (status.get("phase") == "unauthenticated" or bool(status.get("auth_error")))
         self.signin_button.set_visible(needs_auth)
         self.open_button.set_visible(not needs_auth)
-        self.open_button.set_sensitive(fresh and status.get("phase") in ("ready", "scanning"))
+        self.open_button.set_sensitive(fresh and status.get("phase") in ("ready", "scanning", "reconciling"))
         busy = status.get("refreshing") or status.get("uploading")
         if self._syncing and not busy and fresh:
             self._syncing = False

@@ -100,22 +100,38 @@ if ! gnome-extensions enable "$UUID" 2>/dev/null; then
   echo "  The panel icon appears after you log out and back in."
 fi
 
-# An existing service may point at an older checkout; regenerate it here.
+# regenerate UNIT INIT_CMD FOLDER: rewrite an existing unit for this install.
+# Folders still mounted on directly (before mounts moved behind links) are
+# converted, which needs the service stopped for a moment.
+regenerate() {
+  local unit="$1" init_cmd="$2" folder="$3" was_enabled was_active=no
+  was_enabled=$(systemctl --user is-enabled "$unit" 2>/dev/null || true)
+  if [[ ! -L "$folder" ]]; then
+    if systemctl --user is-active --quiet "$unit"; then
+      was_active=yes
+      echo "Moving $folder behind a link (restarting $unit)…"
+      systemctl --user stop "$unit"
+    fi
+    fusermount -uz "$folder" >/dev/null 2>&1 || true
+  fi
+  "$DEST/icloudctl" "$init_cmd" "$folder" >/dev/null
+  [[ "$was_enabled" == enabled ]] || systemctl --user disable "$unit" >/dev/null 2>&1 || true
+  if [[ "$was_active" == yes ]]; then
+    systemctl --user start "$unit"
+  else
+    echo "Updated $unit (restart it to pick up the new driver)."
+  fi
+}
+
 if [[ -f "$HOME/.config/systemd/user/icloud.service" && -f "$HOME/.config/icloud-linux/icloud.env" ]]; then
   # shellcheck disable=SC1091
   source "$HOME/.config/icloud-linux/icloud.env"
-  was_enabled=$(systemctl --user is-enabled icloud.service 2>/dev/null || true)
-  "$DEST/icloudctl" init "${ICLOUD_MOUNT:-$HOME/iCloud}" >/dev/null
-  [[ "$was_enabled" == enabled ]] || systemctl --user disable icloud.service >/dev/null 2>&1 || true
-  echo "Updated icloud.service to use $DEST (restart it to pick up the new driver)."
+  regenerate icloud.service init "${ICLOUD_MOUNT:-$HOME/iCloud}"
 fi
 if [[ -f "$HOME/.config/systemd/user/icloud-photos.service" && -f "$HOME/.config/icloud-linux/photos.env" ]]; then
   # shellcheck disable=SC1091
   source "$HOME/.config/icloud-linux/photos.env"
-  was_enabled=$(systemctl --user is-enabled icloud-photos.service 2>/dev/null || true)
-  "$DEST/icloudctl" photos-init "${ICLOUD_PHOTOS_MOUNT:-$HOME/iCloud Photos}" >/dev/null
-  [[ "$was_enabled" == enabled ]] || systemctl --user disable icloud-photos.service >/dev/null 2>&1 || true
-  echo "Updated icloud-photos.service (restart it to pick up the new driver)."
+  regenerate icloud-photos.service photos-init "${ICLOUD_PHOTOS_MOUNT:-$HOME/iCloud Photos}"
 fi
 
 echo "Done. Open “iCloud Drive” from the app grid, or run: $BIN_DIR/icloud-drive"
