@@ -16,10 +16,7 @@ DOWNLOAD_MODES = [
     ("background", "Download everything", "Keep a full local copy of your iCloud Drive"),
     ("lazy", "Download when opened", "Only files you open use disk space"),
 ]
-PHOTO_MODES = [
-    ("lazy", "Download when opened", "Thumbnails come from Apple’s previews"),
-    ("background", "Download everything", "Keep a full local copy of your photo library"),
-]
+
 
 
 def relative_time(timestamp):
@@ -86,27 +83,6 @@ def summarize(service, status, config):
                 "Automatic sync is off. Use Sync Now to upload.", None, "warning")
     when = relative_time(status.get("last_refresh"))
     return ("io.github.jridder.ICloudLinux-done-symbolic", "Up to Date", f"Last checked {when}" if when else None, None, "success")
-
-
-def summarize_photos(service, status):
-    """One-line state of icloud-photos.service for the Photos row."""
-    if not service.running:
-        return "Off" if service.active_state != "failed" else "Stopped unexpectedly — see the log"
-    if status.get("pid") != service.main_pid:
-        return "Starting…"
-    phase = status.get("phase")
-    crawl = status.get("crawl") or {}
-    hydration = status.get("hydration") or {}
-    if phase == "unauthenticated" or status.get("auth_error"):
-        return "Sign-in required"
-    if phase in ("starting", "connecting"):
-        return "Connecting to iCloud…"
-    if phase == "scanning" or status.get("refreshing"):
-        return f"Scanning… {crawl.get('photos', 0):,} items"
-    done, total = hydration.get("completed", 0), hydration.get("total", 0)
-    if total and done < total:
-        return f"Downloading {done:,} of {total:,}"
-    return f"{status.get('photos', 0):,} items · read-only"
 
 
 def page(title, content, tag=None, header_end=None):
@@ -537,7 +513,6 @@ class MainPage(Adw.NavigationPage):
         super().__init__(title="iCloud Drive", tag="main")
         self.window = window
         self.service = window.service
-        self.photos_service = window.photos_service
         self._syncing = False
         self._loading = True
         self._updating = False
@@ -557,7 +532,6 @@ class MainPage(Adw.NavigationPage):
         prefs = Adw.PreferencesPage()
         prefs.add(self._build_status())
         prefs.add(self._build_service())
-        prefs.add(self._build_photos())
         prefs.add(self._build_account())
         prefs.add(self._build_syncing())
         self.sync_paths = PathListGroup(
@@ -583,7 +557,6 @@ class MainPage(Adw.NavigationPage):
         self.set_child(view)
 
         self.service.connect("changed", lambda *_: self.refresh())
-        self.photos_service.connect("changed", lambda *_: self.refresh())
         self.monitor = Gio.File.new_for_path(str(backend.STATE_DIR)).monitor_directory(
             Gio.FileMonitorFlags.WATCH_MOVES, None)
         self.monitor.connect("changed", self._on_state_changed)
@@ -645,11 +618,6 @@ class MainPage(Adw.NavigationPage):
         self.sync_button.set_sensitive(fresh and status.get("phase") == "ready" and not busy and not self._syncing)
 
         self._updating = True
-        self.photos_row.set_active(self.photos_service.running)
-        self.photos_row.set_subtitle(summarize_photos(self.photos_service, backend.read_photos_status()))
-        self.photos_folder_row.set_subtitle(str(backend.photos_mount_dir()))
-        for row in (self.photos_folder_row, self.photos_mode_row):
-            row.set_sensitive(self.photos_service.installed)
         self.running_row.set_active(self.service.running)
         self.autostart_row.set_active(self.service.enabled)
         self._updating = False
@@ -657,7 +625,7 @@ class MainPage(Adw.NavigationPage):
             self.banner.set_revealed(False)
 
     def _on_state_changed(self, _monitor, file, _other, event):
-        if file.get_basename() in ("status.json", "photos-status.json") and event in (
+        if file.get_basename() == "status.json" and event in (
             Gio.FileMonitorEvent.CHANGES_DONE_HINT, Gio.FileMonitorEvent.CREATED,
             Gio.FileMonitorEvent.MOVED_IN, Gio.FileMonitorEvent.RENAMED,
         ):
@@ -673,8 +641,6 @@ class MainPage(Adw.NavigationPage):
         self._syncing = True
         self.sync_button.set_sensitive(False)
         self.service.sync_now(lambda error: error and self.window.toast(f"Could not sync: {error}"))
-        if self.photos_service.running:
-            self.photos_service.sync_now()
 
     # service --------------------------------------------------------------
 
@@ -732,45 +698,6 @@ class MainPage(Adw.NavigationPage):
 
         dialog.select_folder(self.window, None, done)
 
-    # photos ---------------------------------------------------------------
-
-    def _build_photos(self):
-        group = Adw.PreferencesGroup(
-            title="iCloud Photos",
-            description="Browse your photo library as a read-only folder. Nothing on this "
-                        "computer can change or delete your photos.",
-        )
-        self.photos_row = Adw.SwitchRow(title="Show iCloud Photos")
-        self.photos_row.connect("notify::active", self._on_photos_toggled)
-        group.add(self.photos_row)
-        self.photos_folder_row = Adw.ActionRow(title="Folder", use_markup=False)
-        open_button = Gtk.Button(label="Open", valign=Gtk.Align.CENTER)
-        open_button.connect("clicked", lambda *_: self.window.open_folder(backend.photos_mount_dir()))
-        self.photos_folder_row.add_suffix(open_button)
-        group.add(self.photos_folder_row)
-        self.photos_mode_row = Adw.ComboRow(title="Photos on This Computer")
-        self.photos_mode_row.set_model(Gtk.StringList.new([title for _key, title, _ in PHOTO_MODES]))
-        self.photos_mode_row.connect("notify::selected", self._on_photos_mode)
-        group.add(self.photos_mode_row)
-        return group
-
-    def _on_photos_toggled(self, row, _pspec):
-        if self._updating or row.get_active() == self.photos_service.running:
-            return
-        if row.get_active():
-            self.window.enable_photos()
-        else:
-            self.photos_service.set_enabled(False, lambda _e: self.photos_service.stop(
-                self._report("stop iCloud Photos")))
-
-    def _on_photos_mode(self, row, _pspec):
-        row.set_subtitle(PHOTO_MODES[row.get_selected()][2])
-        if self._loading:
-            return
-        backend.update_config(photos_warmup_mode=PHOTO_MODES[row.get_selected()][0])
-        if self.photos_service.running:
-            self.photos_service.restart(self._report("restart iCloud Photos"))
-
     # account --------------------------------------------------------------
 
     def _build_account(self):
@@ -818,10 +745,6 @@ class MainPage(Adw.NavigationPage):
         mode = config.get("warmup_mode")
         self.mode_row.set_selected(modes.index(mode) if mode in modes else 0)
         self.mode_row.set_subtitle(DOWNLOAD_MODES[self.mode_row.get_selected()][2])
-        photo_modes = [key for key, _title, _ in PHOTO_MODES]
-        photo_mode = config.get("photos_warmup_mode")
-        self.photos_mode_row.set_selected(photo_modes.index(photo_mode) if photo_mode in photo_modes else 0)
-        self.photos_mode_row.set_subtitle(PHOTO_MODES[self.photos_mode_row.get_selected()][2])
         self.auto_row.set_active(bool(config.get("auto_sync", True)))
         self.refresh_row.set_value(max(1, int(config.get("remote_refresh_interval_seconds", 300)) // 60))
         self.upload_row.set_value(int(config.get("upload_interval_seconds", 30)))
@@ -916,7 +839,6 @@ class Window(Adw.ApplicationWindow):
     def __init__(self, app):
         super().__init__(application=app, title="iCloud Drive", default_width=640, default_height=760)
         self.service = backend.Service()
-        self.photos_service = backend.Service(backend.PHOTOS_UNIT)
         self.main_page = None
         self.nav = Adw.NavigationView()
         self.toasts = Adw.ToastOverlay(child=self.nav)
@@ -949,26 +871,6 @@ class Window(Adw.ApplicationWindow):
     def open_folder(self, path=None):
         folder = Gio.File.new_for_path(str(path or backend.mount_dir()))
         Gtk.FileLauncher.new(folder).launch(self, None, None)
-
-    def enable_photos(self):
-        def start(_error=None):
-            self.photos_service.start(lambda error: error and self.toast(f"Could not start iCloud Photos: {error}"))
-
-        if self.photos_service.installed:
-            self.photos_service.set_enabled(True, start)
-            return
-
-        mount = backend.photos_mount_dir()
-
-        def after_init(ok, output):
-            if not ok:
-                self.toast(output.strip().splitlines()[-1] if output.strip() else "Could not set up iCloud Photos.")
-                self.main_page.refresh()
-                return
-            backend.add_bookmark(mount, "iCloud Photos")
-            self.photos_service.daemon_reload(start)
-
-        backend.run_icloudctl(["photos-init", str(mount)], after_init)
 
     # setup -----------------------------------------------------------------
 
@@ -1044,9 +946,6 @@ class Window(Adw.ApplicationWindow):
         self.nav.pop_to_page(self.main_page)
         self.toast("Signed in.")
         self.service.restart(self._report_start)
-        if self.photos_service.running:
-            # photos.py copies the fresh session when it starts.
-            self.photos_service.restart()
 
     def sign_out(self):
         pending = backend.read_status().get("pending_uploads") or 0

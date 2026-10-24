@@ -123,7 +123,12 @@ Differences from the CLI setup:
   the extension.
 - The app rewrites `config.yaml` without its comments.
 
-### iCloud Photos (read-only)
+### iCloud Photos (read-only, superseded)
+
+> The GNOME app no longer offers this mount: [Cloud Photos](https://github.com/jridder/cloudphotos)
+> keeps a full local copy of the library instead. `photos.py` and `icloudctl photos-init`
+> still work if you want the read-only folder.
+
 
 Turn on **Show iCloud Photos** in the app (or run `./icloudctl photos-init`
 and `systemctl --user start icloud-photos.service`) to mount your photo
