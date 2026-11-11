@@ -1072,5 +1072,73 @@ class KeyringLookupTests(unittest.TestCase):
         self.assertEqual(run.call_count, 3)
 
 
+class SessionAlertTests(unittest.TestCase):
+    """An expired session shows as auth_error (the panel's red alert), and a
+    folder that couldn't be listed doesn't count as deleted."""
+
+    def setUp(self):
+        self.root = tempfile.mkdtemp(prefix="icloud-linux-test-")
+        self.mirror = LocalMirror(self.root)
+        self.state = SyncState(os.path.join(self.root, "state.sqlite3"))
+        self.api = Mock()
+        self.engine = ICloudSyncEngine(self.api, self.mirror, self.state, Mock())
+        driver.STATUS.update(force=True, auth_error=None)
+
+    def tearDown(self):
+        self.engine.shutdown()
+        shutil.rmtree(self.root)
+        driver.STATUS.update(force=True, auth_error=None)
+
+    def add_clean_file(self, path):
+        self.mirror.write(path, b"content", 0)
+        self.state.upsert_entry({
+            "path": path, "type": "file", "parent_path": os.path.dirname(path) or "/",
+            "remote_drivewsid": f"remote-{path}", "size": 7, "mtime": 123, "hydrated": True,
+            "dirty": False, "tombstone": False, "last_synced_at": 1, "synced_path": path,
+        })
+
+    def test_expired_session_raises_alert_and_keeps_local_files(self):
+        self.add_clean_file("/a.txt")
+        root = Mock()
+        root.get_children.side_effect = PyiCloudAPIResponseException("Authentication required for Account.", 401)
+        self.api.drive.root = root
+
+        self.engine._run_remote_refresh("manual")
+
+        self.assertTrue(driver.STATUS.data.get("auth_error"))
+        self.assertIsNotNone(self.state.get_entry("/a.txt"))
+        self.assertTrue(self.mirror.exists("/a.txt"))
+
+    def test_unlisted_folder_keeps_its_files(self):
+        self.add_clean_file("/dirA/x.txt")
+        self.add_clean_file("/gone.txt")
+        self.api.drive.root = FakeNode("root", [FakeNode("dirA", fail=True, delay=0)], delay=0)
+
+        self.engine._run_remote_refresh("manual")
+
+        self.assertIsNotNone(self.state.get_entry("/dirA/x.txt"))
+        self.assertTrue(self.mirror.exists("/dirA/x.txt"))
+        self.assertIsNone(self.state.get_entry("/gone.txt"))  # really gone
+        self.assertFalse(driver.STATUS.data.get("auth_error"))  # "boom" isn't a sign-in problem
+
+    def test_successful_refresh_clears_alert(self):
+        driver.STATUS.update(force=True, auth_error="Authentication required for Account. (401)")
+        self.api.drive.root = FakeNode("root", [], delay=0)
+
+        self.engine._run_remote_refresh("manual")
+
+        self.assertIsNone(driver.STATUS.data.get("auth_error"))
+
+    def test_which_errors_mean_sign_in_again(self):
+        auth = "Authentication required for Account."
+        self.assertTrue(driver.session_expired(PyiCloudAPIResponseException(auth, 401)))
+        self.assertTrue(driver.session_expired(PyiCloudAPIResponseException(auth, 421)))
+        # One item refused on an aging session: not the whole session.
+        self.assertFalse(driver.session_expired(PyiCloudAPIResponseException(auth, 421), item_level=True))
+        self.assertTrue(driver.session_expired(PyiCloudAPIResponseException(auth, 401), item_level=True))
+        self.assertFalse(driver.session_expired(PyiCloudAPIResponseException("Gone", 410)))
+        self.assertFalse(driver.session_expired(RuntimeError("network down")))
+
+
 if __name__ == "__main__":
     unittest.main()

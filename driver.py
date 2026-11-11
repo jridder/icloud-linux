@@ -165,6 +165,32 @@ class StatusFile:
 STATUS = StatusFile()
 
 
+def session_expired(exc, item_level=False):
+    """Whether *exc* means Apple no longer accepts this session: sign in again.
+
+    pyicloud raises an expired session as a plain API error whose reason is
+    "Authentication required for Account." (401/421/450…). For a request
+    about one item (*item_level*), a 421 with that reason is Apple refusing
+    just that item on an aging session, not the whole session (see
+    ICloudSyncEngine._is_refused_item), so it doesn't count.
+    """
+    if isinstance(
+        exc,
+        (
+            PyiCloud2FARequiredException,
+            PyiCloud2SARequiredException,
+            PyiCloudAuthRequiredException,
+            PyiCloudFailedLoginException,
+        ),
+    ):
+        return True
+    if not isinstance(exc, PyiCloudAPIResponseException):
+        return False
+    if item_level and str(getattr(exc, "code", "")) == "421":
+        return False
+    return str(getattr(exc, "reason", "") or "").startswith("Authentication required")
+
+
 def lookup_keyring_password(username, logger, attempts=6, delay=5):
     """Fetch the Apple ID password stored by the GNOME app in the login keyring.
 
@@ -903,6 +929,8 @@ class ICloudSyncEngine:
         self.download_retry_attempts = {}
         # path -> etag of files iCloud refused with 421 (needs a fresh sign-in)
         self.unservable = {}
+        # Folders the last crawl couldn't list (see _crawl_remote_snapshot_inner).
+        self.last_crawl_incomplete = set()
         self.download_retry_timers = {}
         self.threads = []
         self.hydration_total = 0
@@ -976,6 +1004,7 @@ class ICloudSyncEngine:
             self._after_initial_state()
         except Exception as exc:
             self.logger.error("First remote crawl failed: %s", exc)
+            self._note_session_error(exc)
             STATUS.update(phase="ready", error=str(exc))
             self._after_initial_state()
         finally:
@@ -1176,6 +1205,11 @@ class ICloudSyncEngine:
         they arrive, so the first scan can show folders while it runs.
         """
         snapshot = {}
+        # Folders whose contents this crawl didn't see (listing failed, timed
+        # out, or the crawl stopped first). What's under them isn't known to
+        # be gone, so _apply_remote_snapshot leaves it alone.
+        incomplete = set()
+        self.last_crawl_incomplete = incomplete
         queue = deque([(self.api.drive.root, "/")])
         started_at = time.time()
         last_progress_log = started_at
@@ -1198,6 +1232,7 @@ class ICloudSyncEngine:
                             "Timed out enumerating %s after %ss — skipping folder", path, FOLDER_TIMEOUT
                         )
                         del in_flight[future]
+                        incomplete.add(path)
 
                 for future in done:
                     path, _submitted = in_flight.pop(future)
@@ -1205,7 +1240,12 @@ class ICloudSyncEngine:
                     try:
                         children = future.result()
                     except Exception as exc:
+                        if path == "/":
+                            # Nothing listed at all: there's no snapshot to
+                            # apply (and an expired session shows up here).
+                            raise
                         self.logger.error("Failed to enumerate %s: %s", path, exc)
+                        incomplete.add(path)
                         continue
 
                     metas = []
@@ -1233,6 +1273,8 @@ class ICloudSyncEngine:
                     break
         finally:
             executor.shutdown(wait=False, cancel_futures=True)
+            incomplete.update(path for _node, path in queue)
+            incomplete.update(path for path, _submitted in in_flight.values())
 
         self.logger.info(
             "Remote metadata crawl complete: %s entries across %s folders in %.1fs",
@@ -1263,9 +1305,13 @@ class ICloudSyncEngine:
 
             self._refresh_clean_entry(existing, meta)
 
+        incomplete = self.last_crawl_incomplete
         for entry in self.state.list_entries():
             remote_id = entry["remote_drivewsid"]
             if not remote_id or remote_id in remote_ids:
+                continue
+            if any(entry["path"] == p or entry["path"].startswith(p.rstrip("/") + "/") for p in incomplete):
+                # Its folder wasn't listed this time; unknown, not deleted.
                 continue
             if entry["dirty"]:
                 self.logger.warning("Remote deleted dirty path %s; keeping local copy for upload", entry["path"])
@@ -1567,8 +1613,18 @@ class ICloudSyncEngine:
             snapshot = self._crawl_remote_snapshot()
             self._apply_remote_snapshot(snapshot, crawl_started_at=crawl_started_at)
             self._log_sync("refresh-complete", reason=reason)
+            # The session works again (say, after a blip): drop the alert.
+            if STATUS.data.get("auth_error"):
+                STATUS.update(force=True, auth_error=None)
         except Exception as exc:
             self.logger.error("Remote refresh failed (%s): %s", reason, exc)
+            self._note_session_error(exc)
+
+    def _note_session_error(self, exc, item_level=False):
+        """Show "Sign-in required" (the panel's red alert) when *exc* says
+        Apple no longer accepts the session."""
+        if session_expired(exc, item_level=item_level):
+            STATUS.update(force=True, auth_error=str(exc) or type(exc).__name__)
 
     def _refresh_loop(self):
         immediate = self.has_persistent_cache()
@@ -1659,6 +1715,7 @@ class ICloudSyncEngine:
             self._log_sync("directory-sync-complete", path=entry["path"])
         except Exception as exc:
             self.logger.error("Failed syncing directory %s: %s", entry["path"], exc)
+            self._note_session_error(exc, item_level=True)
 
     def _sync_file(self, entry):
         parent_node = self._ensure_remote_parent(entry["path"])
@@ -1700,6 +1757,7 @@ class ICloudSyncEngine:
             self._log_sync("file-sync-complete", path=entry["path"], size=meta.get("size"))
         except Exception as exc:
             self.logger.error("Failed syncing file %s: %s", entry["path"], exc)
+            self._note_session_error(exc, item_level=True)
 
     def _sync_move_or_rename(self, entry):
         synced_path = entry["synced_path"]

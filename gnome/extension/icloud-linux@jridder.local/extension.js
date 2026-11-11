@@ -100,7 +100,8 @@ class Indicator extends PanelMenu.Button {
         this._photosUnit = {};
         this._status = {};
 
-        this._icon = new St.Icon({style_class: 'system-status-icon'});
+        // icloud-linux-icon sets the red of the error badge (see stylesheet.css).
+        this._icon = new St.Icon({style_class: 'system-status-icon icloud-linux-icon'});
         this.add_child(this._icon);
 
         this._statusItem = new PopupMenu.PopupMenuItem('', {reactive: false});

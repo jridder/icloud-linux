@@ -1,3 +1,9 @@
 .icloud-linux-status {
   font-weight: bold;
 }
+
+/* The badge on the error icon (sign-in required, service failed) is drawn
+   with class="error", which takes this color. Readable on dark and light panels. */
+.icloud-linux-icon {
+  error-color: #f66151;
+}
