@@ -1081,6 +1081,8 @@ class SessionAlertTests(unittest.TestCase):
         self.mirror = LocalMirror(self.root)
         self.state = SyncState(os.path.join(self.root, "state.sqlite3"))
         self.api = Mock()
+        self.api.requires_2fa = False
+        self.api.requires_2sa = False
         self.engine = ICloudSyncEngine(self.api, self.mirror, self.state, Mock())
         driver.STATUS.update(force=True, auth_error=None)
 
@@ -1088,6 +1090,12 @@ class SessionAlertTests(unittest.TestCase):
         self.engine.shutdown()
         shutil.rmtree(self.root)
         driver.STATUS.update(force=True, auth_error=None)
+
+    def expired_root(self):
+        root = Mock()
+        root.get_children.side_effect = PyiCloudAPIResponseException(
+            "Authentication required for Account.", 421)
+        return root
 
     def add_clean_file(self, path):
         self.mirror.write(path, b"content", 0)
@@ -1138,6 +1146,86 @@ class SessionAlertTests(unittest.TestCase):
         self.assertTrue(driver.session_expired(PyiCloudAPIResponseException(auth, 401), item_level=True))
         self.assertFalse(driver.session_expired(PyiCloudAPIResponseException("Gone", 410)))
         self.assertFalse(driver.session_expired(RuntimeError("network down")))
+
+
+    def test_expired_session_signs_in_again_and_refreshes(self):
+        self.add_clean_file("/a.txt")
+        self.api.drive.root = self.expired_root()
+        self.engine.unservable["/refused.txt"] = "etag"
+
+        def renew(force_refresh=False):
+            self.api.drive.root = FakeNode("root", [FakeNode("a.txt", delay=0)], delay=0)
+        self.api.authenticate.side_effect = renew
+
+        self.engine._run_remote_refresh("scheduled")
+
+        self.api.authenticate.assert_called_once_with(force_refresh=False)
+        self.assertFalse(driver.STATUS.data.get("auth_error"))
+        self.assertIsNotNone(self.state.get_entry("/a.txt"))
+        self.assertEqual(self.engine.unservable, {})  # refused files get another try
+
+    def test_full_sign_in_when_the_token_alone_is_not_enough(self):
+        self.api.drive.root = self.expired_root()
+
+        def renew(force_refresh=False):
+            if force_refresh:
+                self.api.drive.root = FakeNode("root", [], delay=0)
+        self.api.authenticate.side_effect = renew
+
+        self.engine._run_remote_refresh("scheduled")
+
+        self.assertEqual([c.kwargs for c in self.api.authenticate.call_args_list],
+                         [{"force_refresh": False}, {"force_refresh": True}])
+        self.assertFalse(driver.STATUS.data.get("auth_error"))
+
+    def test_backs_off_when_signing_in_again_does_not_help(self):
+        self.api.drive.root = self.expired_root()
+
+        self.engine._run_remote_refresh("scheduled")
+        self.assertEqual(self.api.authenticate.call_count, 2)
+        self.assertTrue(driver.STATUS.data.get("auth_error"))
+
+        self.engine._run_remote_refresh("scheduled")  # five minutes later
+        self.assertEqual(self.api.authenticate.call_count, 2)
+
+        self.engine.reauth_not_before = 0  # backoff over
+        self.engine._run_remote_refresh("scheduled")
+        self.assertEqual(self.api.authenticate.call_count, 4)
+        self.assertEqual(self.engine.reauth_backoff, 4 * driver.REAUTH_BACKOFF_SECONDS)
+
+    def test_stops_when_apple_wants_a_code(self):
+        self.api.drive.root = self.expired_root()
+
+        def renew(force_refresh=False):
+            self.api.requires_2fa = True
+        self.api.authenticate.side_effect = renew
+
+        self.engine._run_remote_refresh("scheduled")
+        self.engine.reauth_not_before = 0
+        self.engine._run_remote_refresh("scheduled")
+
+        self.assertEqual(self.api.authenticate.call_count, 1)
+        self.assertTrue(driver.STATUS.data.get("auth_error"))
+
+    def test_stops_when_the_password_is_rejected(self):
+        self.api.drive.root = self.expired_root()
+        self.api.authenticate.side_effect = driver.PyiCloudFailedLoginException("Invalid email/password combination.")
+
+        self.engine._run_remote_refresh("scheduled")
+        self.engine.reauth_not_before = 0
+        self.engine._run_remote_refresh("scheduled")
+
+        self.assertEqual(self.api.authenticate.call_count, 1)
+        self.assertTrue(driver.STATUS.data.get("auth_error"))
+
+    def test_other_failures_do_not_sign_in(self):
+        root = Mock()
+        root.get_children.side_effect = RuntimeError("network down")
+        self.api.drive.root = root
+
+        self.engine._run_remote_refresh("scheduled")
+
+        self.api.authenticate.assert_not_called()
 
 
 if __name__ == "__main__":

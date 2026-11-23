@@ -46,6 +46,12 @@ IO_CHUNK_SIZE = 1024 * 1024
 # Give up on a file after this many failed background downloads, until it
 # changes remotely or the service restarts.
 MAX_DOWNLOAD_ATTEMPTS = 5
+# Apple ends the iCloud.com web session after about a day; the trusted
+# session (90 days) signs back in without a code. Wait this long after a
+# failed silent sign-in, doubling up to the cap, so Apple never sees a
+# burst of logins.
+REAUTH_BACKOFF_SECONDS = 30 * 60
+REAUTH_BACKOFF_MAX_SECONDS = 6 * 60 * 60
 
 
 def normalize_icloud_path(path):
@@ -931,6 +937,11 @@ class ICloudSyncEngine:
         self.unservable = {}
         # Folders the last crawl couldn't list (see _crawl_remote_snapshot_inner).
         self.last_crawl_incomplete = set()
+        # Silent sign-in after Apple drops the web session (_restore_session).
+        self.reauth_lock = threading.Lock()
+        self.reauth_not_before = 0.0
+        self.reauth_backoff = REAUTH_BACKOFF_SECONDS
+        self.reauth_disabled = None  # reason, when retrying can't help
         self.download_retry_timers = {}
         self.threads = []
         self.hydration_total = 0
@@ -1606,19 +1617,94 @@ class ICloudSyncEngine:
         self._log_sync("refresh-requested")
         self.refresh_now_event.set()
 
-    def _run_remote_refresh(self, reason):
+    def _run_remote_refresh(self, reason, attempt=0):
         try:
             self._log_sync("refresh-start", reason=reason)
             crawl_started_at = int(time.time())
             snapshot = self._crawl_remote_snapshot()
             self._apply_remote_snapshot(snapshot, crawl_started_at=crawl_started_at)
             self._log_sync("refresh-complete", reason=reason)
+            self.reauth_backoff = REAUTH_BACKOFF_SECONDS
             # The session works again (say, after a blip): drop the alert.
             if STATUS.data.get("auth_error"):
                 STATUS.update(force=True, auth_error=None)
         except Exception as exc:
             self.logger.error("Remote refresh failed (%s): %s", reason, exc)
+            # Sign back in and try again: first by validating the saved
+            # session token, then with a full sign-in (trust token, password).
+            if session_expired(exc) and attempt < 2 and self._restore_session(force=attempt == 1):
+                self._run_remote_refresh(f"{reason}, after signing in again", attempt + 1)
+                return
+            if attempt and session_expired(exc):
+                self._reauth_failed("Apple still rejects the session after signing in again")
             self._note_session_error(exc)
+
+    def _restore_session(self, force=False):
+        """Sign back in without the user: Apple ends the web session after
+        about a day, but the trusted session renews it without a code.
+
+        Returns True when the sign-in went through, so the caller can retry.
+        Rate-limited (see REAUTH_BACKOFF_SECONDS); gives up for good when
+        Apple wants a code or rejects the password, since only the user
+        can fix that.
+        """
+        if not self.reauth_lock.acquire(blocking=False):
+            return False  # another thread is signing in
+        try:
+            if self.reauth_disabled or self.stop_event.is_set():
+                return False
+            if not force and time.monotonic() < self.reauth_not_before:
+                return False
+            api = self.api
+            if getattr(api, "_password_raw", "") is None:
+                password = lookup_keyring_password(getattr(api, "account_name", ""), self.logger, attempts=1)
+                if password:
+                    api._password_raw = password
+            self.logger.info("iCloud session expired; signing in again (%s)", "full" if force else "token")
+            # Keep downloads off the session while its cookies are replaced.
+            held = self.download_semaphore.acquire(timeout=120)
+            try:
+                api.authenticate(force_refresh=force)
+            finally:
+                if held:
+                    self.download_semaphore.release()
+            if api.requires_2fa or api.requires_2sa:
+                self.reauth_disabled = "Apple wants a verification code"
+                self.logger.error("Signing in again needs a verification code; sign in from the iCloud app.")
+                STATUS.update(force=True, auth_error="Sign in again: Apple wants a verification code.")
+                return False
+        except PyiCloudFailedLoginException as exc:
+            # Wrong password or a locked account: retrying risks a lockout.
+            self.reauth_disabled = str(exc) or type(exc).__name__
+            self.logger.error("Signing in again failed: %s; sign in from the iCloud app.", exc)
+            STATUS.update(force=True, auth_error=str(exc) or type(exc).__name__)
+            return False
+        except Exception as exc:
+            self.logger.error("Signing in again failed: %s", exc)
+            self._reauth_failed_locked(str(exc))
+            return False
+        finally:
+            if self.reauth_lock.locked():
+                self.reauth_lock.release()
+        self.logger.info("Signed in to iCloud again")
+        # Files refused on the dead session are worth another try.
+        self.unservable.clear()
+        if self.warmup_mode == "background":
+            try:
+                self._schedule_all_unhydrated()
+            except Exception as exc:
+                self.logger.warning("Couldn't requeue downloads after signing in: %s", exc)
+        return True
+
+    def _reauth_failed(self, reason):
+        with self.reauth_lock:
+            self._reauth_failed_locked(reason)
+
+    def _reauth_failed_locked(self, reason):
+        delay = self.reauth_backoff
+        self.reauth_not_before = time.monotonic() + delay
+        self.reauth_backoff = min(delay * 2, REAUTH_BACKOFF_MAX_SECONDS)
+        self.logger.warning("Not signing in again for %d min (%s)", delay // 60, reason)
 
     def _note_session_error(self, exc, item_level=False):
         """Show "Sign-in required" (the panel's red alert) when *exc* says
